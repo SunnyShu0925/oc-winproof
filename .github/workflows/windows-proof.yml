@@ -1,0 +1,56 @@
+name: Windows Native Proof (PR #172869)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/cron-cwd-trim-201"
+
+jobs:
+  windows-proof:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI
+        run: pnpm build cliStartup
+        continue-on-error: true
+
+      - name: Verify CLI built
+        run: node openclaw.mjs --version
+        shell: pwsh
+
+      - name: Run Windows native proof
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          & pwsh -File windows-runner-proof.ps1 2>&1 | Tee-Object -FilePath windows-proof-output.txt
+
+      - name: Upload proof output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-proof-output
+          path: |
+            windows-proof-output.txt
+            C:\oc-winproof\gw-stdout.log
+            C:\oc-winproof\gw-stderr.log
+          retention-days: 30
