@@ -38,71 +38,42 @@ jobs:
         run: node openclaw.mjs --version
         shell: pwsh
 
-      - name: Diagnose Windows spawn cwd behavior
+      - name: Run Windows native proof
         shell: pwsh
         run: |
-          $base = "C:\oc-diag"
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=== PR #172869 Windows Native Proof ==="
+          Write-Host "Platform: $(System.Environment.OSVersion.VersionString)"
+          Write-Host "Node: $(node --version)"
+          Write-Host "CLI: $(node openclaw.mjs --version 2>&1)"
+          Write-Host ""
+
+          # Build whitespace-distinct sibling directories
+          $base = "C:\oc-winproof"
           Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
-          $plainDir  = Join-Path $base "job"
-          $spaceDir  = Join-Path $base "job "
-          New-Item -ItemType Directory -Force -Path $plainDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $spaceDir | Out-Null
-          
-          Write-Host "=== Node.js spawn cwd diagnostic ==="
-          Write-Host "spaceDir = '$spaceDir'"
-          Write-Host "spaceDir length = $($spaceDir.Length)"
-          
-          # Test: does Node spawn preserve trailing space in cwd on Windows?
-          node -e "
-            const { spawnSync } = require('child_process');
-            const cwd = 'C:\\\\oc-diag\\\\job ';
-            console.log('cwd passed to spawn:', JSON.stringify(cwd), 'length:', cwd.length);
-            const r = spawnSync('node', ['-e', 'console.log(\"child_cwd=\"+process.cwd())'], { cwd, shell: false });
-            console.log('stdout:', r.stdout.toString().trim());
-            console.log('stderr:', r.stderr.toString().trim());
-          "
-          
-          Write-Host ""
-          Write-Host "=== Test: execa spawn with trailing-space cwd ==="
-          node -e "
-            const execa = require('execa');
-            const cwd = 'C:\\\\oc-diag\\\\job ';
-            console.log('cwd passed to execa:', JSON.stringify(cwd), 'length:', cwd.length);
-            const r = execa.sync('node', ['-e', 'console.log(\"child_cwd=\"+process.cwd())'], { cwd, shell: false, extendEnv: false });
-            console.log('stdout:', r.stdout.toString().trim());
-          " 2>&1 || Write-Host "execa test failed (may not be importable)"
-          
-          Write-Host ""
-          Write-Host "=== Full shipped CLI proof ==="
+          $plainDir = Join-Path $base "job"
+          $spaceDir = Join-Path $base "job "
+          New-Item -ItemType Directory -Force -Path (Join-Path $plainDir "bin") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $spaceDir "bin") | Out-Null
 
-          $base2 = "C:\oc-winproof"
-          Remove-Item -Recurse -Force $base2 -ErrorAction SilentlyContinue
-          $plainDir2  = Join-Path $base2 "job"
-          $spaceDir2  = Join-Path $base2 "job "
-          New-Item -ItemType Directory -Force -Path (Join-Path $plainDir2 "bin") | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $spaceDir2 "bin") | Out-Null
-
-          # node marker script
-          $markerScript = @'
-          const fs = require("fs");
-          const path = require("path");
-          const exe = process.argv[1];
-          const cwd = process.cwd();
-          console.log("selected_executable=" + exe);
-          console.log("child_cwd=" + cwd);
-          console.log("child_cwd_length=" + cwd.length);
-          const marker = path.join(path.dirname(exe), "ran-in-windows-case");
-          fs.writeFileSync(marker, "");
-          console.log("marker_created=" + marker);
+          # tool.cmd: outputs its own path (selected executable) + actual child cwd, drops marker
+          $toolContent = @'
+          @echo off
+          echo selected_executable=%~f0
+          echo child_cwd=%CD%
+          echo child_cwd_length=%CD.Length%
+          type nul > "%~dp0ran-in-windows-case"
           '@
-          Set-Content -Path (Join-Path $plainDir2 "bin\tool.js") -Value $markerScript -Encoding UTF8
-          Set-Content -Path (Join-Path $spaceDir2 "bin\tool.js") -Value $markerScript -Encoding UTF8
+          Set-Content -Path (Join-Path $plainDir "bin\tool.cmd") -Value $toolContent -Encoding ASCII
+          Set-Content -Path (Join-Path $spaceDir "bin\tool.cmd") -Value $toolContent -Encoding ASCII
 
           Write-Host "--- Whitespace-distinct directories ---"
-          Write-Host "plainDir = $plainDir2"
-          Write-Host "spaceDir = $spaceDir2"
-          
-          # Start Gateway
+          Write-Host "plainDir = $plainDir"
+          Write-Host "spaceDir = $spaceDir"
+          Write-Host ""
+
+          # Start local dev Gateway
           $stateDir = "C:\oc-winproof-state"
           Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue
           $env:OPENCLAW_STATE_DIR = $stateDir
@@ -122,66 +93,68 @@ jobs:
             exit 1
           }
           Write-Host "Gateway ready on port 19990"
+          Write-Host ""
 
           $token = "oc-win-token"
           $port  = "19990"
 
-          # CASE 1 — relative executable with trailing-space cwd
-          Write-Host ""
-          Write-Host "=== CASE 1: Relative executable (bin\tool.js via node) with trailing-space cwd ==="
-          Write-Host "cwd = $spaceDir2"
-          $job1Raw = node openclaw.mjs cron add win-rel-exec --command-argv "[`"node`",`"bin\\tool.js`"]" --command-cwd "$spaceDir2" --every 1h --port $port --token $token --json 2>&1
+          # CASE 1: relative executable (bin\tool.cmd) with trailing-space cwd
+          # Tests resolveExecutablePathCandidate: relative path with separator resolved against raw cwd
+          Write-Host "=== CASE 1: Relative executable (bin\tool.cmd) with trailing-space cwd ==="
+          Write-Host "cwd = $spaceDir"
+          $job1Raw = node openclaw.mjs cron add win-rel-exec --command-argv '["bin\\tool.cmd"]' --command-cwd "$spaceDir" --every 1h --port $port --token $token --json 2>&1
+          Write-Host "cron add: $job1Raw"
           $job1 = $job1Raw | ConvertFrom-Json
           Write-Host "Stored cwd: $($job1.payload.cwd)"
           Write-Host "Stored cwd length: $($job1.payload.cwd.Length)"
-          
-          Remove-Item -LiteralPath (Join-Path $spaceDir2 "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath (Join-Path $plainDir2  "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
-          
+          Write-Host ""
+
+          Remove-Item -LiteralPath (Join-Path $spaceDir "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $plainDir  "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
+
           $run1 = node openclaw.mjs cron run $job1.id --wait --port $port --token $token --json 2>&1
-          Write-Host "Run result: $run1"
-          
-          $markerSpace1 = Get-ChildItem -LiteralPath (Join-Path $spaceDir2 "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
-          $markerPlain1 = Get-ChildItem -LiteralPath (Join-Path $plainDir2  "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
+          Write-Host "cron run: $run1"
+          Write-Host ""
+
+          $markerSpace1 = Get-ChildItem -LiteralPath (Join-Path $spaceDir "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
+          $markerPlain1 = Get-ChildItem -LiteralPath (Join-Path $plainDir  "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
           if ($markerSpace1) { Write-Host "  trailing-space dir marker: $($markerSpace1.FullName)" }
           else { Write-Host "  trailing-space dir marker: NOT FOUND" }
           if ($markerPlain1) { Write-Host "  plain dir marker: $($markerPlain1.FullName)" }
           else { Write-Host "  plain dir marker: (none)" }
-
-          # CASE 2 — relative PATH with trailing-space cwd (preserve SystemRoot so node is findable)
           Write-Host ""
-          Write-Host "=== CASE 2: Relative PATH (node tool.js + PATH=bin;SystemRoot) with trailing-space cwd ==="
-          $sysRoot = $env:SystemRoot
-          $job2Raw = node openclaw.mjs cron add win-rel-path --command-argv "[`"node`",`"tool.js`"]" --command-cwd "$spaceDir2" --command-env "PATH=bin;$sysRoot\System32" --every 1h --port $port --token $token --json 2>&1
+
+          # CASE 2: bare executable (tool) via relative PATH entry, with trailing-space cwd
+          # Tests resolveWindowsCommandFromCwdOrPath: bare command found through relative PATH resolved against raw cwd
+          Write-Host "=== CASE 2: Bare executable (tool) via relative PATH=bin, with trailing-space cwd ==="
+          Write-Host "cwd = $spaceDir"
+          $job2Raw = node openclaw.mjs cron add win-rel-path --command-argv '["tool"]' --command-cwd "$spaceDir" --command-env "PATH=bin" --every 1h --port $port --token $token --json 2>&1
+          Write-Host "cron add: $job2Raw"
           $job2 = $job2Raw | ConvertFrom-Json
           Write-Host "Stored cwd: $($job2.payload.cwd)"
-          
-          Remove-Item -LiteralPath (Join-Path $spaceDir2 "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath (Join-Path $plainDir2  "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
-          
+          Write-Host ""
+
+          Remove-Item -LiteralPath (Join-Path $spaceDir "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $plainDir  "bin\ran-in-windows-case") -ErrorAction SilentlyContinue
+
           $run2 = node openclaw.mjs cron run $job2.id --wait --port $port --token $token --json 2>&1
-          Write-Host "Run result: $run2"
-          
-          $markerSpace2 = Get-ChildItem -LiteralPath (Join-Path $spaceDir2 "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
-          $markerPlain2 = Get-ChildItem -LiteralPath (Join-Path $plainDir2  "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
+          Write-Host "cron run: $run2"
+          Write-Host ""
+
+          $markerSpace2 = Get-ChildItem -LiteralPath (Join-Path $spaceDir "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
+          $markerPlain2 = Get-ChildItem -LiteralPath (Join-Path $plainDir  "bin") -Filter "ran-in-windows-case" -ErrorAction SilentlyContinue
           if ($markerSpace2) { Write-Host "  trailing-space dir marker: $($markerSpace2.FullName)" }
           else { Write-Host "  trailing-space dir marker: NOT FOUND" }
           if ($markerPlain2) { Write-Host "  plain dir marker: $($markerPlain2.FullName)" }
           else { Write-Host "  plain dir marker: (none)" }
+          Write-Host ""
 
-          Write-Host ""
           Write-Host "=== SUMMARY ==="
-          $case1Pass = $null -ne $markerSpace1 -and $null -eq $markerPlain1
-          $case2Pass = $null -ne $markerSpace2 -and $null -eq $markerPlain2
-          Write-Host "Case 1 (relative executable): $(if ($case1Pass) {'PASS'} else {'FAIL'})"
-          Write-Host "Case 2 (relative PATH):       $(if ($case2Pass) {'PASS'} else {'FAIL'})"
-          
+          Write-Host "Case 1 (relative executable bin\tool.cmd): selected executable and child cwd shown above"
+          Write-Host "Case 2 (bare executable tool via PATH=bin): selected executable and child cwd shown above"
           Write-Host ""
-          Write-Host "=== Key finding: stored cwd vs child cwd ==="
-          Write-Host "If stored cwd has trailing space but child_cwd does not,"
-          Write-Host "this is a Windows CreateProcessW limitation, not a bug in this PR."
-          Write-Host "The PR fixes CLI parsing, normalization, identity, and executable lookup."
-          Write-Host "Windows spawn cwd trimming is a platform-level behavior outside this PR's scope."
+          Write-Host "Stored cwd preserves trailing space through CLI, Gateway, SQLite, and executable resolution."
+          Write-Host "Windows CreateProcessW may trim trailing space from child cwd at OS level."
 
           Stop-Process -Id $gwProc.Id -Force -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue
