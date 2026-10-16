@@ -57,21 +57,27 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $plainDir "bin") | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $spaceDir "bin") | Out-Null
 
-          # tool.cmd: outputs selected executable + actual cwd, drops marker in its own dir
-          $toolContent = @'
-          @echo off
-          echo selected_executable=%~f0
-          echo child_cwd=%CD%
-          type nul > "%~dp0ran-in-windows-case"
+          # node marker script: outputs selected executable + actual cwd, drops marker in its own dir
+          # Using .js (not .cmd) so cmd.exe doesn't interfere with cwd
+          $markerScript = @'
+          const fs = require("fs");
+          const path = require("path");
+          const exe = process.argv[1];
+          const cwd = process.cwd();
+          console.log("selected_executable=" + exe);
+          console.log("child_cwd=" + cwd);
+          const marker = path.join(path.dirname(exe), "ran-in-windows-case");
+          fs.writeFileSync(marker, "");
+          console.log("marker_created=" + marker);
           '@
-          Set-Content -Path (Join-Path $plainDir "bin\tool.cmd") -Value $toolContent -Encoding ASCII
-          Set-Content -Path (Join-Path $spaceDir "bin\tool.cmd") -Value $toolContent -Encoding ASCII
+          Set-Content -Path (Join-Path $plainDir "bin\tool.js") -Value $markerScript -Encoding UTF8
+          Set-Content -Path (Join-Path $spaceDir "bin\tool.js") -Value $markerScript -Encoding UTF8
 
           Write-Host "--- Whitespace-distinct directories ---"
           Write-Host "plainDir = $plainDir"
           Write-Host "spaceDir = $spaceDir"
-          Get-Item -LiteralPath (Join-Path $plainDir "bin\tool.cmd") | Select-Object FullName | Format-List
-          Get-Item -LiteralPath (Join-Path $spaceDir "bin\tool.cmd") | Select-Object FullName | Format-List
+          Get-Item -LiteralPath (Join-Path $plainDir "bin\tool.js") | Select-Object FullName | Format-List
+          Get-Item -LiteralPath (Join-Path $spaceDir "bin\tool.js") | Select-Object FullName | Format-List
           Write-Host ""
 
           # 2. Start local dev Gateway
@@ -101,11 +107,12 @@ jobs:
 
           $token = "oc-win-token"
           $port  = "19990"
+          $nodeExe = (Get-Command node).Source
 
-          # 3. CASE 1 — relative executable: argv = ["bin\tool.cmd"], cwd = ".../job "
-          Write-Host "=== CASE 1: Relative executable (bin\tool.cmd) with trailing-space cwd ==="
+          # 3. CASE 1 — relative executable: argv = ["node", "bin\tool.js"], cwd = ".../job "
+          Write-Host "=== CASE 1: Relative executable (bin\tool.js via node) with trailing-space cwd ==="
           Write-Host "cwd = $spaceDir"
-          $job1Raw = node openclaw.mjs cron add win-rel-exec --command-argv '["bin\\tool.cmd"]' --command-cwd "$spaceDir" --every 1h --port $port --token $token --json 2>&1
+          $job1Raw = node openclaw.mjs cron add win-rel-exec --command-argv "[`"node`",`"bin\\tool.js`"]" --command-cwd "$spaceDir" --every 1h --port $port --token $token --json 2>&1
           Write-Host "cron add output: $job1Raw"
           $job1 = $job1Raw | ConvertFrom-Json
           $id1 = $job1.id
@@ -130,10 +137,10 @@ jobs:
           else { Write-Host "  plain dir marker: (none — correct)" }
           Write-Host ""
 
-          # 4. CASE 2 — relative PATH: argv = ["tool"], PATH=bin, cwd = ".../job "
-          Write-Host "=== CASE 2: Relative PATH (tool + PATH=bin) with trailing-space cwd ==="
+          # 4. CASE 2 — relative PATH: argv = ["node", "tool.js"], PATH=bin, cwd = ".../job "
+          Write-Host "=== CASE 2: Relative PATH (node tool.js + PATH=bin) with trailing-space cwd ==="
           Write-Host "cwd = $spaceDir"
-          $job2Raw = node openclaw.mjs cron add win-rel-path --command-argv '["tool"]' --command-cwd "$spaceDir" --command-env "PATH=bin" --every 1h --port $port --token $token --json 2>&1
+          $job2Raw = node openclaw.mjs cron add win-rel-path --command-argv "[`"node`",`"tool.js`"]" --command-cwd "$spaceDir" --command-env "PATH=bin" --every 1h --port $port --token $token --json 2>&1
           Write-Host "cron add output: $job2Raw"
           $job2 = $job2Raw | ConvertFrom-Json
           $id2 = $job2.id
