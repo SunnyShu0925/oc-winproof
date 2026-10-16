@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Enable pnpm
         run: corepack enable pnpm
@@ -54,3 +54,4 @@ jobs:
             C:\oc-winproof\gw-stdout.log
             C:\oc-winproof\gw-stderr.log
           retention-days: 30
+          if-no-files-found: warn
