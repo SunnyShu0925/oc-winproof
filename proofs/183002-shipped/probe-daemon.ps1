@@ -75,7 +75,7 @@ node (Join-Path $ScriptsDir "journal-check.cjs") $dbPath "after Case 1 schema-in
 Write-Host ""
 Write-Host "--- start sibling EXCLUSIVE write lock (10s) ---"
 $lockProc = Start-Process -PassThru -NoNewWindow `
-  -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"14" `
+  -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"18" `
   -RedirectStandardOutput (Join-Path $StateDir "lock-out.log") `
   -RedirectStandardError (Join-Path $StateDir "lock-err.log")
 Start-Sleep -Seconds 1
