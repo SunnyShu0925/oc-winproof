@@ -10,11 +10,13 @@ const JUMP_MS = Number(process.env.PROOF_JUMP_MS || 0);
 const JUMP_AT_MS = Number(process.env.PROOF_JUMP_AT_MS || 3500);
 const START = Date.now();
 let firstNow = null;
+let nowCalls = 0;
 if (JUMP_MS > 0) {
   const realDateNow = Date.now.bind(Date);
   let jumped = false;
   Date.now = () => {
     const v = realDateNow();
+    nowCalls++;
     if (firstNow === null) {
       firstNow = v;
       console.log("[clock-inject] first Date.now at t+" + (v - START) + "ms");
@@ -29,7 +31,9 @@ if (JUMP_MS > 0) {
           JUMP_MS +
           "ms at t+" +
           (realDateNow() - START) +
-          "ms (first Date.now was at t+" +
+          "ms (Date.now calls so far=" +
+          nowCalls +
+          ", first at t+" +
           (firstNow === null ? "?" : firstNow - START) +
           "ms)"
       );
