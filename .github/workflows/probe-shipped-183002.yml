@@ -11,16 +11,12 @@ on:
 jobs:
   windows-proof:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: openclaw
     steps:
       - name: Checkout openclaw PR branch
         uses: actions/checkout@v4
         with:
           repository: SunnyShu0925/openclaw
           ref: ${{ github.event.inputs.pr_branch }}
-          path: openclaw
           fetch-depth: 1
 
       - name: Setup Node.js
