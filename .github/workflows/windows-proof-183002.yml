@@ -1,0 +1,114 @@
+name: Windows Native Proof (PR #183002 monotonic lease-read deadline)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/schtasks-sqlite-lease-read-deadline-monotonic-182"
+
+jobs:
+  windows-proof:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        shell: pwsh
+        run: |
+          Copy-Item ../oc-winproof/proofs/183002/*.ts .
+          Get-ChildItem proof-183002-*.ts | Select-Object Name, Length
+          Write-Host "OPENCLAW_STATE_DIR=$env:OPENCLAW_STATE_DIR"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Confirm runtime
+        shell: pwsh
+        run: |
+          Write-Host "Node: $(node --version)"
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          node --input-type=module -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(x)'); db.close(); console.log('node:sqlite OK on', process.platform)"
+
+      - name: Run PR #183002 native proof (post-fix)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== PR #183002 Windows Native Proof (post-fix, performance.now) ==="
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "Node: $(node --version)"
+          Write-Host ""
+
+          # Case A: control (no wall-clock jump) — both must recover
+          Write-Host "--- Case A: no wall-clock jump (control) ---"
+          node --import tsx/esm proof-183002-windows.ts
+          Write-Host ""
+
+          # Case B: +20s wall-clock forward jump mid-retry (NTP correction)
+          Write-Host "--- Case B: +20000ms wall-clock forward jump (NTP correction) ---"
+          $env:PROOF_JUMP_MS = "20000"
+          node --import tsx/esm proof-183002-windows.ts
+          Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
+          Write-Host ""
+
+          Write-Host "post-fix: control and forward-jump both expected SUCCESS."
+
+      - name: Run PR #183002 native proof (pre-fix, Date.now reverted)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "src/daemon/schtasks-sqlite.ts"
+          Copy-Item $src "$src.postfix.bak"
+          # Revert performance.now() -> Date.now() (pre-fix behavior)
+          (Get-Content $src -Raw) -replace 'performance\.now\(\)', 'Date.now()' | Set-Content $src -NoNewline -Encoding utf8
+          Write-Host "=== PR #183002 Windows Native Proof (pre-fix, Date.now) ==="
+          Write-Host "deadline line: $((Select-String -Path $src -Pattern 'deadline =').Line.Trim())"
+
+          Write-Host "--- Case A: no wall-clock jump (control) ---"
+          node --import tsx/esm proof-183002-windows.ts
+          Write-Host ""
+
+          Write-Host "--- Case B: +20000ms wall-clock forward jump (NTP correction) ---"
+          $env:PROOF_JUMP_MS = "20000"
+          node --import tsx/esm proof-183002-windows.ts
+          Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
+          Write-Host ""
+
+          Write-Host "pre-fix: control expected SUCCESS, forward-jump expected FAILED (lease discarded)."
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Upload proof output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-proof-183002-output
+          path: |
+            openclaw/proof-183002-windows.ts
+            openclaw/src/daemon/schtasks-sqlite.ts
+          retention-days: 30
+          if-no-files-found: warn
