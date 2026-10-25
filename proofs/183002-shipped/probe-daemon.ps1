@@ -15,13 +15,27 @@ Write-Host "ScriptsDir  = $ScriptsDir"
 Write-Host "StateDir    = $StateDir"
 Write-Host ""
 
-# --- isolated state dir + schema ---
-Remove-Item -Recurse -Force $StateDir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $StateDir "state") | Out-Null
-$env:OPENCLAW_STATE_DIR = $StateDir
-$dbPath = Join-Path $StateDir "state\openclaw.sqlite"
+# --- canonical state dir (NOT isolated) so isDefaultInstallIdentity passes ---
+# canonical = <account home>/.openclaw/state/openclaw.sqlite
+$accountHome = $env:USERPROFILE
+if ([string]::IsNullOrWhiteSpace($accountHome)) { $accountHome = $env:HOME }
+$stateDir = Join-Path $accountHome ".openclaw"
+$stateDbDir = Join-Path $stateDir "state"
+Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $stateDbDir | Out-Null
+Remove-Item Env:OPENCLAW_STATE_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:OPENCLAW_HOME -ErrorAction SilentlyContinue
+Remove-Item Env:OPENCLAW_CONFIG_PATH -ErrorAction SilentlyContinue
+Remove-Item Env:OPENCLAW_PROFILE -ErrorAction SilentlyContinue
+$dbPath = Join-Path $stateDbDir "openclaw.sqlite"
+Write-Host "canonical state db: $dbPath"
 node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
 Write-Host "state db exists=$(Test-Path $dbPath)"
+Write-Host ""
+Write-Host "USERPROFILE = $env:USERPROFILE"
+Write-Host "HOME        = $env:HOME"
+Write-Host "OPENCLAW_PROFILE = $env:OPENCLAW_PROFILE"
+Write-Host ""
 
 # --- minimal scheduled task so daemon stop sees the service as loaded ---
 $taskName = "OpenClawProbe183002"
@@ -34,6 +48,7 @@ Write-Host ""
 
 $env:OPENCLAW_SERVICE_KIND = "schtasks"
 $env:OPENCLAW_WINDOWS_TASK_NAME = $taskName
+$env:OPENCLAW_DEBUG = "1"
 
 # --- Case 0: no lock, no clock jump (baseline: shipped path should succeed) ---
 Write-Host "--- Case 0: daemon stop --force (no lock, no clock jump) ---"
@@ -44,7 +59,14 @@ Pop-Location
 Write-Host "Case 0 daemon stop exit: $case0Exit"
 Write-Host ""
 
-# --- sibling EXCLUSIVE write lock (SQLITE_BUSY source) ---
+# --- Case 1 setup: recreate task + reset db, then sibling EXCLUSIVE lock ---
+# (Case 0 may have removed the task / settled state)
+schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+$probeCmd = "node `"$OpenClawDir\openclaw.mjs`" --version"
+schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Null
+Remove-Item $dbPath -ErrorAction SilentlyContinue
+node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
+Write-Host ""
 Write-Host "--- start sibling EXCLUSIVE write lock (8s) ---"
 $lockProc = Start-Process -PassThru -NoNewWindow `
   -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"8" `
