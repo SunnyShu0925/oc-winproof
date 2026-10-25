@@ -1,0 +1,21 @@
+name: Probe systemd user session
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe systemd user manager
+        run: |
+          set -x
+          id -u
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+          systemctl --user status 2>&1 | head -5 || true
+          sudo loginctl enable-linger "$USER" 2>&1 || true
+          sudo loginctl show-user "$USER" 2>&1 | head -5 || true
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          ls -la "$XDG_RUNTIME_DIR" 2>&1 | head -5 || true
+          systemctl --user status 2>&1 | head -5 || true
+          systemd-run --user --unit=probe-systemd -- /bin/sleep 20 2>&1 || true
+          systemctl --user list-units 'probe-systemd*' 2>&1 | head -5 || true
+          systemctl --user stop probe-systemd 2>&1 || true
