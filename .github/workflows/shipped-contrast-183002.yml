@@ -1,0 +1,149 @@
+name: Shipped Contrast (PR 183002)
+
+# Real `openclaw daemon stop --force` on windows-latest, with a real Scheduled
+# Task, a real sibling BEGIN EXCLUSIVE lock on the state SQLite db, and a real
+# forward wall-clock jump injected into the shipped process. The post-fix and
+# pre-fix runs use the same lock/jump matrix so the elapsed times are directly
+# comparable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/schtasks-sqlite-lease-read-deadline-monotonic-182"
+      lock_seconds:
+        description: "How long the sibling process holds BEGIN EXCLUSIVE"
+        required: false
+        default: "25"
+      jump_at_ms:
+        description: "When the wall-clock jump lands (ms after process start)"
+        required: false
+        default: "12000"
+      jump_ms:
+        description: "Forward wall-clock jump size (ms)"
+        required: false
+        default: "20000"
+
+jobs:
+  windows-proof:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (probe scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy probe scripts into openclaw tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path proofs/183002-shipped-contrast | Out-Null
+          Copy-Item ../oc-winproof/proofs/183002-shipped-contrast/* proofs/183002-shipped-contrast/
+          Get-ChildItem proofs/183002-shipped-contrast | Select-Object Name, Length
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI (post-fix)
+        run: pnpm build cliStartup
+        continue-on-error: true
+
+      - name: Verify CLI
+        shell: pwsh
+        run: |
+          Write-Host "Node: $(node --version)"
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "CLI: $(node openclaw.mjs --version 2>&1)"
+          node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(x)'); db.close(); console.log('node:sqlite OK on', process.platform)"
+
+      - name: Probe shipped daemon stop (post-fix, performance.now)
+        timeout-minutes: 10
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path
+          & "../oc-winproof/proofs/183002-shipped-contrast/probe-daemon.ps1" `
+            -OpenClawDir $root `
+            -ScriptsDir (Join-Path $root "proofs/183002-shipped-contrast") `
+            -Mode postfix `
+            -LockSeconds ${{ github.event.inputs.lock_seconds }} `
+            -JumpAtMs ${{ github.event.inputs.jump_at_ms }} `
+            -JumpMs ${{ github.event.inputs.jump_ms }}
+          exit 0
+
+      - name: Rebuild pre-fix (Date.now) from a clean dist
+        if: always()
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          Write-Host "--- revert to pre-fix (Date.now) ---"
+          $src = "src/daemon/schtasks-sqlite.ts"
+          Copy-Item $src "$src.postfix.bak"
+          (Get-Content $src -Raw) -replace 'performance\.now\(\)', 'Date.now()' | Set-Content $src -NoNewline -Encoding utf8
+          Write-Host "source deadline line: $((Select-String -Path $src -Pattern 'deadline =').Line.Trim())"
+          Write-Host "--- clean rebuild so the revert definitely reaches the shipped artifacts ---"
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          pnpm build cliStartup
+          Write-Host "--- verify built artifacts use Date.now ---"
+          $hits = Get-ChildItem dist -Recurse -Filter *.mjs | Select-String -Pattern "isScheduledTaskSqliteSharingError"
+          $files = @($hits | Select-Object -ExpandProperty Path -Unique)
+          Write-Host "chunks containing retry owner: $($files.Count)"
+          $allDate = $true
+          $perfCount = 0
+          foreach ($f in $files) {
+            $deadline = (Select-String -Path $f -Pattern "for \(const deadline = .*15e3").Line
+            Write-Host "  $([System.IO.Path]::GetFileName($f)) :: $($deadline.Trim())"
+            if ($deadline -notmatch "Date\.now\(\) \+ 15e3") { $allDate = $false }
+            $perfCount += @(Select-String -Path $f -Pattern "performance\.now\(\) \+ 15e3").Count
+          }
+          Write-Host "VERIFY chunks=$($files.Count) allDate=$allDate performanceNowHits=$perfCount"
+          if (-not $allDate -or $files.Count -eq 0) { throw "pre-fix rebuild did not take effect" }
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Probe shipped daemon stop (pre-fix, Date.now)
+        if: always()
+        timeout-minutes: 10
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path
+          & "../oc-winproof/proofs/183002-shipped-contrast/probe-daemon.ps1" `
+            -OpenClawDir $root `
+            -ScriptsDir (Join-Path $root "proofs/183002-shipped-contrast") `
+            -Mode prefix `
+            -LockSeconds ${{ github.event.inputs.lock_seconds }} `
+            -JumpAtMs ${{ github.event.inputs.jump_at_ms }} `
+            -JumpMs ${{ github.event.inputs.jump_ms }}
+          exit 0
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shipped-contrast-183002
+          path: |
+            openclaw/proof-run
+          retention-days: 30
+          if-no-files-found: warn
