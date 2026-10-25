@@ -1,0 +1,64 @@
+name: Probe WhatsApp reachability (PR 183394)
+# Feasibility probe for the real-socket proof of PR 183394:
+# confirm a GitHub-hosted Linux runner can reach web.whatsapp.com and complete
+# the real Baileys pairing handshake far enough to receive a real QR ref.
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: DNS + HTTPS reachability
+        run: |
+          set -x
+          getent hosts web.whatsapp.com || true
+          curl -sS -o /dev/null -w "HTTPS web.whatsapp.com -> %{http_code} in %{time_total}s\n" https://web.whatsapp.com/ || true
+          curl -sS -o /dev/null -w "HTTPS g.whatsapp.net -> %{http_code} in %{time_total}s\n" https://g.whatsapp.net/ || true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Real Baileys pairing handshake (QR from WhatsApp servers)
+        run: |
+          set -e
+          mkdir -p /tmp/waproof && cd /tmp/waproof
+          npm init -y >/dev/null 2>&1
+          npm install baileys@7.0.0-rc14 --no-audit --no-fund 2>&1 | tail -3
+          cat > probe.mjs <<'EOF'
+          import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } from "baileys";
+
+          const { state, saveCreds } = await useMultiFileAuthState("./auth");
+          let version = [2, 3000, 0];
+          try {
+            const latest = await fetchLatestBaileysVersion();
+            version = latest.version;
+            console.log("WA_VERSION", version.join("."), "current", latest.isLatest);
+          } catch (err) {
+            console.log("WA_VERSION fetch failed:", String(err));
+          }
+          const sock = makeWASocket({
+            auth: state,
+            version,
+            printQRInTerminal: false,
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+          });
+          sock.ev.on("creds.update", saveCreds);
+          const t0 = Date.now();
+          let qrCount = 0;
+          sock.ev.on("connection.update", (u) => {
+            if (u.qr) {
+              qrCount += 1;
+              console.log(`QR ${qrCount} at ${Date.now() - t0}ms len=${u.qr.length} prefix=${u.qr.slice(0, 12)}`);
+            }
+            if (u.connection) console.log("CONN", u.connection, u.lastDisconnect?.error?.message ?? "");
+          });
+          setTimeout(() => {
+            console.log(`PROBE_END qrCount=${qrCount} elapsedMs=${Date.now() - t0}`);
+            process.exit(qrCount > 0 ? 0 : 1);
+          }, 75000);
+          EOF
+          node probe.mjs
