@@ -2,6 +2,11 @@ name: Probe shipped daemon stop (PR #183002)
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "openclaw PR branch"
+        required: false
+        default: "fix/schtasks-sqlite-lease-read-deadline-monotonic-182"
 
 jobs:
   probe:
