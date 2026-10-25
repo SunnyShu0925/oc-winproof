@@ -1,0 +1,121 @@
+name: Probe shipped daemon (PR 183002)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/schtasks-sqlite-lease-read-deadline-monotonic-182"
+
+jobs:
+  windows-proof:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI
+        run: pnpm build cliStartup
+        continue-on-error: true
+
+      - name: Verify CLI
+        shell: pwsh
+        run: |
+          Write-Host "Node: $(node --version)"
+          Write-Host "CLI: $(node openclaw.mjs --version 2>&1)"
+
+      - name: Probe shipped daemon stop path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== PROBE: shipped daemon stop path ==="
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "Node: $(node --version)"
+          Write-Host ""
+
+          # Isolated state dir
+          $stateDir = "C:\oc-probe-state"
+          Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $stateDir "state") | Out-Null
+          $env:OPENCLAW_STATE_DIR = $stateDir
+          Write-Host "OPENCLAW_STATE_DIR=$stateDir"
+          $dbPath = Join-Path $stateDir "state\openclaw.sqlite"
+
+          # Initialize state db with the real state_leases schema
+          $schemaInit = @'
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1]);
+db.exec(`
+  PRAGMA journal_mode=DELETE;
+  CREATE TABLE IF NOT EXISTS state_leases (
+    scope TEXT NOT NULL,
+    lease_key TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    expires_at INTEGER,
+    heartbeat_at INTEGER,
+    payload_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (scope, lease_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_state_leases_expiry
+    ON state_leases(expires_at, scope, lease_key)
+    WHERE expires_at IS NOT NULL;
+`);
+console.log("[schema] state_leases ready");
+db.close();
+'@
+          $initScript = "C:\oc-schema-init.cjs"
+          Set-Content -Path $initScript -Value $schemaInit -Encoding utf8
+          node $initScript $dbPath 2>&1
+          Write-Host "state db: $dbPath exists=$(Test-Path $dbPath)"
+          Write-Host ""
+
+          # Create a minimal scheduled task so daemon stop sees it as loaded
+          $taskName = "OpenClawProbe183002"
+          Write-Host "--- Create scheduled task $taskName ---"
+          $probeCmd = "node `"$((Get-Location).Path)\openclaw.mjs`" --version"
+          schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Host
+          Write-Host "schtasks create exit: $LASTEXITCODE"
+          schtasks /Query /TN $taskName /FO LIST 2>&1 | Out-Host
+          Write-Host ""
+
+          $env:OPENCLAW_SERVICE_KIND = "schtasks"
+          $env:OPENCLAW_WINDOWS_TASK_NAME = $taskName
+
+          Write-Host "--- daemon stop --force (no lock) ---"
+          node openclaw.mjs daemon stop --force 2>&1 | Out-Host
+          Write-Host "daemon stop exit: $LASTEXITCODE"
+          Write-Host ""
+
+          Write-Host "=== PROBE DONE ==="
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-shipped-183002-output
+          path: |
+            openclaw/.probe-*.log
+          retention-days: 30
+          if-no-files-found: warn
