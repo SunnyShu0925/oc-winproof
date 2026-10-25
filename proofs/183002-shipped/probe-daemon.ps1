@@ -35,6 +35,15 @@ Write-Host ""
 $env:OPENCLAW_SERVICE_KIND = "schtasks"
 $env:OPENCLAW_WINDOWS_TASK_NAME = $taskName
 
+# --- Case 0: no lock, no clock jump (baseline: shipped path should succeed) ---
+Write-Host "--- Case 0: daemon stop --force (no lock, no clock jump) ---"
+Push-Location $OpenClawDir
+node openclaw.mjs daemon stop --force 2>&1 | Out-Host
+$case0Exit = $LASTEXITCODE
+Pop-Location
+Write-Host "Case 0 daemon stop exit: $case0Exit"
+Write-Host ""
+
 # --- sibling EXCLUSIVE write lock (SQLITE_BUSY source) ---
 Write-Host "--- start sibling EXCLUSIVE write lock (8s) ---"
 $lockProc = Start-Process -PassThru -NoNewWindow `
@@ -49,8 +58,11 @@ Write-Host ""
 Write-Host "--- daemon stop --force with clock injection ---"
 $env:PROOF_JUMP_MS = "20000"
 $env:PROOF_JUMP_AT_MS = "2500"
+$injectPath = Join-Path $ScriptsDir "clock-inject.mjs"
+$injectUrl = "file:///" + ($injectPath -replace '\\','/')
+Write-Host "clock-inject url: $injectUrl"
 Push-Location $OpenClawDir
-node --import (Join-Path $ScriptsDir "clock-inject.mjs") openclaw.mjs daemon stop --force 2>&1 | Out-Host
+node --import $injectUrl openclaw.mjs daemon stop --force 2>&1 | Out-Host
 $stopExit = $LASTEXITCODE
 Pop-Location
 Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
