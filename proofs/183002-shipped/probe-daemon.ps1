@@ -31,6 +31,7 @@ $dbPath = Join-Path $stateDbDir "openclaw.sqlite"
 Write-Host "canonical state db: $dbPath"
 node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
 Write-Host "state db exists=$(Test-Path $dbPath)"
+node (Join-Path $ScriptsDir "journal-check.cjs") $dbPath "after schema-init"
 Write-Host ""
 Write-Host "USERPROFILE = $env:USERPROFILE"
 Write-Host "HOME        = $env:HOME"
@@ -59,6 +60,7 @@ node openclaw.mjs daemon stop --force 2>&1 | Out-Host
 $case0Exit = $LASTEXITCODE
 Pop-Location
 Write-Host "Case 0 daemon stop exit: $case0Exit"
+node (Join-Path $ScriptsDir "journal-check.cjs") $dbPath "after Case 0 daemon stop"
 Write-Host ""
 
 # --- Case 1 setup: recreate task + reset db, then sibling EXCLUSIVE lock ---
@@ -69,8 +71,9 @@ $probeCmd = "node `"$OpenClawDir\openclaw.mjs`" gateway --dev --port $gatewayPor
 schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Null
 Remove-Item $dbPath -ErrorAction SilentlyContinue
 node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
+node (Join-Path $ScriptsDir "journal-check.cjs") $dbPath "after Case 1 schema-init"
 Write-Host ""
-Write-Host "--- start sibling EXCLUSIVE write lock (8s) ---"
+Write-Host "--- start sibling EXCLUSIVE write lock (10s) ---"
 $lockProc = Start-Process -PassThru -NoNewWindow `
   -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"10" `
   -RedirectStandardOutput (Join-Path $StateDir "lock-out.log") `
