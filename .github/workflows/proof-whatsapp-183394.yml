@@ -1,0 +1,105 @@
+name: WhatsApp QR wait clock-skew proof (PR 183394)
+
+# Real-socket proof for PR 183394: shipped `openclaw gateway` + shipped
+# `openclaw gateway call web.login.start/web.login.wait` drive the real
+# `waitForWebLogin` against a REAL Baileys socket that receives REAL QR refs
+# from WhatsApp servers (no socket stand-in). Mid-wait the Gateway process's
+# wall clock is rewound 60 s (Date.now only; performance.now/timers untouched).
+#
+# post-fix  -> wait must still end at the configured timeout
+# pre-fix   -> wait is inflated by the rewind (timeout + 60 s)
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/whatsapp-login-qr-deadline-wall-clock"
+      wait_timeout_ms:
+        description: "web.login.wait timeoutMs"
+        required: false
+        default: "90000"
+      jump_at_ms:
+        description: "When (ms after wait start) the wall clock is rewound"
+        required: false
+        default: "30000"
+      jump_ms:
+        description: "Wall-clock rewind size (ms)"
+        required: false
+        default: "60000"
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [post-fix, pre-fix]
+    name: ${{ matrix.variant }}
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        working-directory: openclaw
+        run: |
+          mkdir -p proofs/183394
+          cp ../oc-winproof/proofs/183394/* proofs/183394/
+          chmod +x proofs/183394/run-proof.sh
+          ls -l proofs/183394
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        working-directory: openclaw
+        run: pnpm install --frozen-lockfile
+
+      - name: Revert login-qr clock reads to wall clock (pre-fix variant)
+        if: matrix.variant == 'pre-fix'
+        working-directory: openclaw
+        run: |
+          sed -i 's/const deadline = performance.now() + timeoutMs;/const deadline = Date.now() + timeoutMs;/' extensions/whatsapp/src/login-qr.ts
+          sed -i 's/const remaining = deadline - performance.now();/const remaining = deadline - Date.now();/' extensions/whatsapp/src/login-qr.ts
+          grep -nE "const deadline = |const remaining = " extensions/whatsapp/src/login-qr.ts
+          git diff --stat
+
+      - name: Build CLI
+        working-directory: openclaw
+        run: pnpm build cliStartup
+        continue-on-error: true
+
+      - name: Verify CLI
+        working-directory: openclaw
+        run: node openclaw.mjs --version
+
+      - name: Show loaded WhatsApp channel plugin
+        working-directory: openclaw
+        run: |
+          node openclaw.mjs plugins list 2>&1 | grep -iE "whatsapp|channels" | head -10 || true
+
+      - name: Run shipped-Gateway real-socket proof
+        working-directory: openclaw
+        env:
+          PROOF_VARIANT: ${{ matrix.variant }}
+          PROOF_WAIT_TIMEOUT_MS: ${{ github.event.inputs.wait_timeout_ms }}
+          PROOF_JUMP_AT_MS: ${{ github.event.inputs.jump_at_ms }}
+          PROOF_JUMP_MS: ${{ github.event.inputs.jump_ms }}
+        run: bash proofs/183394/run-proof.sh
