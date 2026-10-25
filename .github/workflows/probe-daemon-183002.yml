@@ -69,6 +69,27 @@ jobs:
             -StateDir "C:\oc-probe-state" `
             -Mode postfix
 
+      - name: Probe shipped daemon stop (pre-fix, Date.now reverted)
+        shell: pwsh
+        run: |
+          Write-Host "--- revert to pre-fix (Date.now) ---"
+          $src = "src/daemon/schtasks-sqlite.ts"
+          Copy-Item $src "$src.postfix.bak"
+          (Get-Content $src -Raw) -replace 'performance\.now\(\)', 'Date.now()' | Set-Content $src -NoNewline -Encoding utf8
+          Write-Host "deadline line: $((Select-String -Path $src -Pattern 'deadline =').Line.Trim())"
+          # openclaw.mjs is a build artifact; rebuild so the revert takes effect
+          Write-Host "--- rebuilding CLI with pre-fix Date.now ---"
+          pnpm build cliStartup
+          Write-Host "rebuilt deadline line: $((Select-String -Path $src -Pattern 'deadline =').Line.Trim())"
+          $root = (Get-Location).Path
+          & "../oc-winproof/proofs/183002-shipped/probe-daemon.ps1" `
+            -OpenClawDir $root `
+            -ScriptsDir (Join-Path $root "proofs/183002-shipped") `
+            -StateDir "C:\oc-probe-state" `
+            -Mode prefix
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
       - name: Upload probe output
         if: always()
         uses: actions/upload-artifact@v4

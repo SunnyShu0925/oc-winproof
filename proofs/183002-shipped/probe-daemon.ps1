@@ -87,12 +87,14 @@ $injectPath = Join-Path $ScriptsDir "clock-inject.mjs"
 $injectUrl = "file:///" + ($injectPath -replace '\\','/')
 Write-Host "clock-inject url: $injectUrl"
 Push-Location $OpenClawDir
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 node --import $injectUrl openclaw.mjs daemon stop --force 2>&1 | Out-Host
 $stopExit = $LASTEXITCODE
+$sw.Stop()
 Pop-Location
 Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
 Remove-Item Env:PROOF_JUMP_AT_MS -ErrorAction SilentlyContinue
-Write-Host "daemon stop exit: $stopExit"
+Write-Host "daemon stop exit: $stopExit (elapsed $($sw.Elapsed.TotalSeconds)s)"
 
 # wait for lock to release
 Start-Sleep -Seconds 6
