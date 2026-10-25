@@ -1,4 +1,4 @@
-name: Probe shipped daemon (PR 183002)
+name: Probe Daemon Copy (PR 183002)
 
 on:
   workflow_dispatch:
@@ -11,13 +11,30 @@ on:
 jobs:
   windows-proof:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: openclaw
     steps:
       - name: Checkout openclaw PR branch
         uses: actions/checkout@v4
         with:
           repository: SunnyShu0925/openclaw
           ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
           fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        shell: pwsh
+        run: |
+          Copy-Item ../oc-winproof/proofs/183002/*.ts .
+          Get-ChildItem proof-183002-*.ts | Select-Object Name, Length
+          Write-Host "OPENCLAW_STATE_DIR=$env:OPENCLAW_STATE_DIR"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -30,81 +47,68 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build CLI
-        run: pnpm build cliStartup
-        continue-on-error: true
-
-      - name: Verify CLI
+      - name: Confirm runtime
         shell: pwsh
         run: |
           Write-Host "Node: $(node --version)"
-          Write-Host "CLI: $(node openclaw.mjs --version 2>&1)"
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(x)'); db.close(); console.log('node:sqlite OK on', process.platform)"
 
-      - name: Probe shipped daemon stop path
+      - name: Run PR #183002 native proof (post-fix)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host "=== PROBE: shipped daemon stop path ==="
+          Write-Host "=== PR #183002 Windows Native Proof (post-fix, performance.now) ==="
           Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "Node: $(node --version)"
           Write-Host ""
 
-          $stateDir = "C:\oc-probe-state"
-          Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path (Join-Path $stateDir "state") | Out-Null
-          $env:OPENCLAW_STATE_DIR = $stateDir
-          Write-Host "OPENCLAW_STATE_DIR=$stateDir"
-          $dbPath = Join-Path $stateDir "state\openclaw.sqlite"
-
-          $schemaInit = @'
-const { DatabaseSync } = require("node:sqlite");
-const db = new DatabaseSync(process.argv[1]);
-db.exec(`
-  PRAGMA journal_mode=DELETE;
-  CREATE TABLE IF NOT EXISTS state_leases (
-    scope TEXT NOT NULL,
-    lease_key TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    expires_at INTEGER,
-    heartbeat_at INTEGER,
-    payload_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (scope, lease_key)
-  );
-`);
-console.log("[schema] state_leases ready");
-db.close();
-'@
-          $initScript = "C:\oc-schema-init.cjs"
-          Set-Content -Path $initScript -Value $schemaInit -Encoding utf8
-          node $initScript $dbPath 2>&1
-          Write-Host "state db exists=$(Test-Path $dbPath)"
+          # Case A: control (no wall-clock jump) — both must recover
+          Write-Host "--- Case A: no wall-clock jump (control) ---"
+          node --import tsx/esm proof-183002-windows.ts
           Write-Host ""
 
-          $taskName = "OpenClawProbe183002"
-          Write-Host "--- Create scheduled task $taskName ---"
-          $probeCmd = "node `"$((Get-Location).Path)\openclaw.mjs`" --version"
-          schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Host
-          Write-Host "schtasks create exit: $LASTEXITCODE"
-          schtasks /Query /TN $taskName /FO LIST 2>&1 | Out-Host
+          # Case B: +20s wall-clock forward jump mid-retry (NTP correction)
+          Write-Host "--- Case B: +20000ms wall-clock forward jump (NTP correction) ---"
+          $env:PROOF_JUMP_MS = "20000"
+          node --import tsx/esm proof-183002-windows.ts
+          Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
           Write-Host ""
 
-          $env:OPENCLAW_SERVICE_KIND = "schtasks"
-          $env:OPENCLAW_WINDOWS_TASK_NAME = $taskName
+          Write-Host "post-fix: control and forward-jump both expected SUCCESS."
 
-          Write-Host "--- daemon stop --force (no lock) ---"
-          node openclaw.mjs daemon stop --force 2>&1 | Out-Host
-          Write-Host "daemon stop exit: $LASTEXITCODE"
+      - name: Run PR #183002 native proof (pre-fix, Date.now reverted)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "src/daemon/schtasks-sqlite.ts"
+          Copy-Item $src "$src.postfix.bak"
+          # Revert performance.now() -> Date.now() (pre-fix behavior)
+          (Get-Content $src -Raw) -replace 'performance\.now\(\)', 'Date.now()' | Set-Content $src -NoNewline -Encoding utf8
+          Write-Host "=== PR #183002 Windows Native Proof (pre-fix, Date.now) ==="
+          Write-Host "deadline line: $((Select-String -Path $src -Pattern 'deadline =').Line.Trim())"
+
+          Write-Host "--- Case A: no wall-clock jump (control) ---"
+          node --import tsx/esm proof-183002-windows.ts
           Write-Host ""
 
-          Write-Host "=== PROBE DONE ==="
+          Write-Host "--- Case B: +20000ms wall-clock forward jump (NTP correction) ---"
+          $env:PROOF_JUMP_MS = "20000"
+          node --import tsx/esm proof-183002-windows.ts
+          Remove-Item Env:PROOF_JUMP_MS -ErrorAction SilentlyContinue
+          Write-Host ""
 
-      - name: Upload probe output
+          Write-Host "pre-fix: control expected SUCCESS, forward-jump expected FAILED (lease discarded)."
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Upload proof output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: probe-shipped-183002-output
+          name: windows-proof-183002-output
           path: |
-            openclaw/.probe-*.log
+            openclaw/proof-183002-windows.ts
+            openclaw/src/daemon/schtasks-sqlite.ts
           retention-days: 30
           if-no-files-found: warn
