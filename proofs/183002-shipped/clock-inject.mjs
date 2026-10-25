@@ -7,21 +7,31 @@
 //   performance.now(), so the retry loop continues until the sibling releases
 //   the exclusive lock (success).
 const JUMP_MS = Number(process.env.PROOF_JUMP_MS || 0);
-const JUMP_AT_MS = Number(process.env.PROOF_JUMP_AT_MS || 2500);
+const JUMP_AT_MS = Number(process.env.PROOF_JUMP_AT_MS || 3500);
+const START = Date.now();
+let firstNow = null;
 if (JUMP_MS > 0) {
   const realDateNow = Date.now.bind(Date);
   let jumped = false;
-  const t0 = realDateNow();
+  Date.now = () => {
+    const v = realDateNow();
+    if (firstNow === null) {
+      firstNow = v;
+      console.log("[clock-inject] first Date.now at t+" + (v - START) + "ms");
+    }
+    return jumped ? v + JUMP_MS : v;
+  };
   setTimeout(() => {
     if (!jumped) {
       jumped = true;
-      Date.now = () => realDateNow() + JUMP_MS;
       console.log(
         "[clock-inject] Date.now forward-jumped +" +
           JUMP_MS +
-          "ms at process t+" +
-          (realDateNow() - t0) +
-          "ms"
+          "ms at t+" +
+          (realDateNow() - START) +
+          "ms (first Date.now was at t+" +
+          (firstNow === null ? "?" : firstNow - START) +
+          "ms)"
       );
     }
   }, JUMP_AT_MS);

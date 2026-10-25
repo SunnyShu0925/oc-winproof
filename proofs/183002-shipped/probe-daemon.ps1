@@ -72,7 +72,7 @@ node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
 Write-Host ""
 Write-Host "--- start sibling EXCLUSIVE write lock (8s) ---"
 $lockProc = Start-Process -PassThru -NoNewWindow `
-  -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"8" `
+  -FilePath "node" -ArgumentList (Join-Path $ScriptsDir "hold-exclusive-lock.cjs"),$dbPath,"10" `
   -RedirectStandardOutput (Join-Path $StateDir "lock-out.log") `
   -RedirectStandardError (Join-Path $StateDir "lock-err.log")
 Start-Sleep -Seconds 1
@@ -82,7 +82,7 @@ Get-Content (Join-Path $StateDir "lock-out.log") -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "--- daemon stop --force with clock injection ---"
 $env:PROOF_JUMP_MS = "20000"
-$env:PROOF_JUMP_AT_MS = "2500"
+$env:PROOF_JUMP_AT_MS = "3500"
 $injectPath = Join-Path $ScriptsDir "clock-inject.mjs"
 $injectUrl = "file:///" + ($injectPath -replace '\\','/')
 Write-Host "clock-inject url: $injectUrl"
