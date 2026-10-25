@@ -63,7 +63,7 @@ console.log(`[proof] state db ready: ${dbPath} (journal_mode=DELETE)`);
 
 // 2) 子进程持真实 EXCLUSIVE 写锁
 const holderScript = fileURLToPath(new URL("./proof-183002-holder.ts", import.meta.url));
-const holder = spawn(process.execPath, ["--import", "tsx/esm", holderScript, dbPath, String(8_000)], {
+const holder = spawn(process.execPath, ["--import", "tsx/esm", holderScript, dbPath, String(25_000)], {
   stdio: "inherit",
   env,
 });
