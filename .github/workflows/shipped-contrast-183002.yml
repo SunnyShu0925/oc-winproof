@@ -109,16 +109,18 @@ jobs:
           $hits = Get-ChildItem dist -Recurse -Filter *.mjs | Select-String -Pattern "isScheduledTaskSqliteSharingError"
           $files = @($hits | Select-Object -ExpandProperty Path -Unique)
           Write-Host "chunks containing retry owner: $($files.Count)"
-          $allDate = $true
+          $dateCount = 0
           $perfCount = 0
           foreach ($f in $files) {
-            $deadline = (Select-String -Path $f -Pattern "for \(const deadline = .*15e3").Line
-            Write-Host "  $([System.IO.Path]::GetFileName($f)) :: $($deadline.Trim())"
-            if ($deadline -notmatch "Date\.now\(\) \+ 15e3") { $allDate = $false }
+            $lines = @(Select-String -Path $f -Pattern "for \(const deadline = .*15e3")
+            foreach ($line in $lines) {
+              Write-Host "  $([System.IO.Path]::GetFileName($f)) :: $($line.Line.Trim())"
+            }
+            $dateCount += @($lines | Where-Object { $_.Line -match "Date\.now\(\) \+ 15e3" }).Count
             $perfCount += @(Select-String -Path $f -Pattern "performance\.now\(\) \+ 15e3").Count
           }
-          Write-Host "VERIFY chunks=$($files.Count) allDate=$allDate performanceNowHits=$perfCount"
-          if (-not $allDate -or $files.Count -eq 0) { throw "pre-fix rebuild did not take effect" }
+          Write-Host "VERIFY chunks=$($files.Count) dateHits=$dateCount performanceNowHits=$perfCount"
+          if ($dateCount -lt 1 -or $perfCount -ne 0) { throw "pre-fix rebuild did not take effect" }
           Copy-Item "$src.postfix.bak" $src -Force
           Remove-Item "$src.postfix.bak" -Force
 
