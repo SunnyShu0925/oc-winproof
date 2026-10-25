@@ -40,7 +40,8 @@ Write-Host ""
 # --- minimal scheduled task so daemon stop sees the service as loaded ---
 $taskName = "OpenClawProbe183002"
 schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
-$probeCmd = "node `"$OpenClawDir\openclaw.mjs`" --version"
+$gatewayPort = "19990"
+$probeCmd = "node `"$OpenClawDir\openclaw.mjs`" gateway --dev --port $gatewayPort"
 schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Host
 Write-Host "schtasks create exit: $LASTEXITCODE"
 schtasks /Query /TN $taskName /FO LIST 2>&1 | Out-Host
@@ -49,6 +50,7 @@ Write-Host ""
 $env:OPENCLAW_SERVICE_KIND = "schtasks"
 $env:OPENCLAW_WINDOWS_TASK_NAME = $taskName
 $env:OPENCLAW_DEBUG = "1"
+$env:OPENCLAW_GATEWAY_PORT = $gatewayPort
 
 # --- Case 0: no lock, no clock jump (baseline: shipped path should succeed) ---
 Write-Host "--- Case 0: daemon stop --force (no lock, no clock jump) ---"
@@ -62,7 +64,8 @@ Write-Host ""
 # --- Case 1 setup: recreate task + reset db, then sibling EXCLUSIVE lock ---
 # (Case 0 may have removed the task / settled state)
 schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
-$probeCmd = "node `"$OpenClawDir\openclaw.mjs`" --version"
+$gatewayPort = "19990"
+$probeCmd = "node `"$OpenClawDir\openclaw.mjs`" gateway --dev --port $gatewayPort"
 schtasks /Create /TN $taskName /TR $probeCmd /SC ONCE /ST 23:59 /F 2>&1 | Out-Null
 Remove-Item $dbPath -ErrorAction SilentlyContinue
 node (Join-Path $ScriptsDir "schema-init.cjs") $dbPath
