@@ -1,18 +1,57 @@
 // ESM preload (loaded via node --import): forward-jumps global Date.now by
-// PROOF_JUMP_MS at PROOF_JUMP_AT_MS after process start. Simulates a wall-clock
-// NTP correction occurring during a lease-read retry loop.
-// Also counts performance.now() calls to detect retry-loop activity (post-fix
-// retry uses performance.now every ~100ms; pre-fix retry uses Date.now).
+// PROOF_JUMP_MS the moment a "retry-loop cadence" is detected on either
+// Date.now() (pre-fix deadline) or performance.now() (post-fix deadline).
+//
+// retryScheduledTaskLeaseRead loops roughly every ~100-550ms (read throws
+// SQLITE_BUSY, then sleep(min(100, remaining)), then deadline re-check). That
+// produces a steady clock-call cadence. We forward-jump Date.now as soon as we
+// see >=3 consecutive clock reads spaced 50-900ms apart, guaranteeing the jump
+// lands AFTER the deadline was seeded (so pre-fix abandons the retry while
+// post-fix, which uses performance.now for its deadline, is unaffected).
 const JUMP_MS = Number(process.env.PROOF_JUMP_MS || 0);
-const JUMP_AT_MS = Number(process.env.PROOF_JUMP_AT_MS || 8000);
 const START = Date.now();
 let firstNow = null;
+let jumped = false;
 let nowCalls = 0;
 let perfCalls = 0;
+
+function maybeJump(kind, elapsedSincePrev, totalSinceStart) {
+  if (jumped || JUMP_MS <= 0) return;
+  if (elapsedSincePrev >= 50 && elapsedSincePrev <= 900) {
+    jump(kind, totalSinceStart);
+  }
+}
+
+function jump(kind, totalSinceStart) {
+  jumped = true;
+  const real = Date.now;
+  Date.now = () => real() + JUMP_MS;
+  console.log(
+    "[clock-inject] Date.now forward-jumped +" +
+      JUMP_MS +
+      "ms on " +
+      kind +
+      " cadence at t~" +
+      Math.round(totalSinceStart) +
+      "ms (Date.now calls=" +
+      nowCalls +
+      ", performance.now calls=" +
+      perfCalls +
+      ", first Date.now at t+" +
+      (firstNow === null ? "?" : firstNow - START) +
+      "ms)"
+  );
+}
+
 if (JUMP_MS > 0) {
   const realDateNow = Date.now.bind(Date);
   const realPerfNow = performance.now.bind(performance);
-  let jumped = false;
+  let prevNow = null;
+  let prevPerf = null;
+  let nowStreak = 0;
+  let perfStreak = 0;
+  const t0 = realPerfNow();
+
   Date.now = () => {
     const v = realDateNow();
     nowCalls++;
@@ -20,44 +59,40 @@ if (JUMP_MS > 0) {
       firstNow = v;
       console.log("[clock-inject] first Date.now at t+" + (v - START) + "ms");
     }
+    if (prevNow !== null) {
+      const dt = v - prevNow;
+      nowStreak = dt >= 50 && dt <= 900 ? nowStreak + 1 : 0;
+      if (nowStreak >= 3) {
+        jump("Date.now", realPerfNow() - t0);
+        return jumped ? v + JUMP_MS : v;
+      }
+    } else {
+      nowStreak = 0;
+    }
+    prevNow = v;
     return jumped ? v + JUMP_MS : v;
   };
+
   performance.now = () => {
+    const v = realPerfNow();
     perfCalls++;
-    return realPerfNow();
+    if (prevPerf !== null) {
+      const dt = v - prevPerf;
+      perfStreak = dt >= 50 && dt <= 900 ? perfStreak + 1 : 0;
+      if (perfStreak >= 3) {
+        jump("performance.now", v - t0);
+        return v;
+      }
+    } else {
+      perfStreak = 0;
+    }
+    prevPerf = v;
+    return v;
   };
-  const t0 = realPerfNow();
-  const iv = setInterval(() => {
-    if (jumped) {
-      clearInterval(iv);
-      return;
-    }
-    const elapsed = realPerfNow() - t0;
-    if (elapsed >= JUMP_AT_MS) {
-      jumped = true;
-      clearInterval(iv);
-      console.log(
-        "[clock-inject] Date.now forward-jumped +" +
-          JUMP_MS +
-          "ms at t~" +
-          Math.round(elapsed) +
-          "ms (Date.now calls=" +
-          nowCalls +
-          ", performance.now calls=" +
-          perfCalls +
-          ", first Date.now at t+" +
-          (firstNow === null ? "?" : firstNow - START) +
-          "ms)"
-      );
-    }
-  }, 50);
+
   console.log(
     "[clock-inject] armed: forward-jump +" +
       JUMP_MS +
-      "ms at t~" +
-      JUMP_AT_MS +
-      "ms (PROOF_JUMP_MS=" +
-      JUMP_MS +
-      ")"
+      "ms on first retry-loop cadence (3 consecutive 50-900ms clock reads)"
   );
 }
