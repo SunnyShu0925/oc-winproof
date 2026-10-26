@@ -13,7 +13,13 @@
 //     returns null prematurely; a backward jump inflates the budget beyond the
 //     caller's timeout.
 import { spawn } from "node:child_process";
-import { readWindowsProcessStartTimeSync } from "./src/infra/windows-process-start.js";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+// Shipped reader resolved from the openclaw checkout root (cwd on the runner).
+const { readWindowsProcessStartTimeSync } = await import(
+  pathToFileURL(join(process.cwd(), "src/infra/windows-process-start.js")).href
+);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -25,13 +31,13 @@ const child = spawn(
 );
 const pid = child.pid;
 console.log(`[proof] target PID=${pid} platform=${process.platform} arch=${process.arch} node=${process.version}`);
-await sleep(500); // let the child fully start so its StartTime is stable
+await sleep(800); // let the child fully start so its StartTime is stable
 
 // 2) Wall-clock jump injection. readWindowsProcessStartTimeSync seeds its
 //    deadline on the FIRST clock read (call 1), then reads the remaining budget
 //    on LATER reads (calls >= 2). We shift Date.now on calls >= 2 only, so the
-//    deadline is seeded from the pre-jump wall clock — exactly the NTP
-//    correction that lands mid-query. The monotonic clock is untouched.
+//    deadline is seeded from the pre-jump wall clock — exactly an NTP
+//    correction landing mid-query. The monotonic clock is untouched.
 function run(label, dirMs) {
   const realDateNow = Date.now;
   let calls = 0;
