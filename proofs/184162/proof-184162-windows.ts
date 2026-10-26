@@ -24,11 +24,10 @@ const { readWindowsProcessStartTimeSync } = await import(
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 1) A real long-lived Windows child as the target PID.
-const child = spawn(
-  "powershell.exe",
-  ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"],
-  { stdio: "ignore" },
-);
+const child =
+  process.platform === "win32"
+    ? spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"], { stdio: "ignore" })
+    : spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
 const pid = child.pid;
 console.log(`[proof] target PID=${pid} platform=${process.platform} arch=${process.arch} node=${process.version}`);
 await sleep(800); // let the child fully start so its StartTime is stable
