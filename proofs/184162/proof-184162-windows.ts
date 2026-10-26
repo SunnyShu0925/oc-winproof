@@ -15,6 +15,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
 
 // Shipped reader + fallback paths resolved from the openclaw checkout root.
 const { readWindowsProcessStartTimeSync, decodeWindowsProcessOutput } = await import(
@@ -29,7 +30,9 @@ function wmicPath(env) {
   return join(systemRoot(env), "System32", "wbem", "wmic.exe");
 }
 function parseDmtf(raw) {
+  if (!raw) return null;
   const text = decodeWindowsProcessOutput(raw);
+  if (typeof text !== "string") return null;
   const m = text.match(/CreationDate=(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})/);
   if (!m) return null;
   const [, y, mo, d, h, mi, se, us, sign, off] = m;
@@ -84,11 +87,14 @@ if (process.platform === "win32") {
   await sleep(800);
   console.log("=== SECTION 2: real WMIC fallback (shipped wmic.exe on live PID) ===");
   try {
-    const r = spawnSync(wmicPath(process.env), ["process", "where", `ProcessId=${pid}`, "get", "CreationDate", "/value"], {
+    const wp = wmicPath(process.env);
+    const exists = existsSync(wp);
+    const r = spawnSync(wp, ["process", "where", `ProcessId=${pid}`, "get", "CreationDate", "/value"], {
       encoding: "utf8", timeout: 5000, windowsHide: true, stdio: ["ignore","pipe","ignore"],
     });
     const parsed = parseDmtf(r.stdout);
-    console.log(`[proof.wmic] wmic.exe status=${r.status} error=${r.error?.code ?? "none"} parsedStartTime=${parsed ?? "null"}`);
+    console.log(`[proof.wmic] wmic.exe path=${wp} exists=${exists} status=${r.status} error=${r.error?.code ?? "none"}`);
+    console.log(`[proof.wmic] parsedStartTime=${parsed ?? "null"}  -> ${exists && parsed ? "WMIC fallback WORKS (acquires identity)" : exists ? "WMIC present but query failed" : "WMIC unavailable on this Windows (deprecated/removed); PowerShell fallback already acquired identity above"}`);
   } catch (e) {
     console.log(`[proof.wmic] THREW ${e.code ?? ""} ${e.message}`);
   }
