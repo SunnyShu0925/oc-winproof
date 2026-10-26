@@ -57,12 +57,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host "=== PR #184162 Windows Native Proof (post-fix: performance.now + Math.ceil) ==="
+          $env:PROC_SAFE_NATIVE = "off"   # force fallback path (native binding absent = sealed helper scenario)
+          Write-Host "=== PR #184162 Windows Native Proof (post-fix: performance.now + Math.ceil, PROC_SAFE_NATIVE=off) ==="
           Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
           Write-Host "Node: $(node --version)"
           Write-Host "deadline line: $((Select-String -Path src/infra/windows-process-start.ts -Pattern 'const deadline =').Line.Trim())"
           Write-Host ""
-          node --import tsx/esm --import ./proofs/184162/force-native-unavailable.mjs proofs/184162/proof-184162-windows.ts
+          node --import tsx/esm proofs/184162/proof-184162-windows.ts
           Write-Host ""
           Write-Host "post-fix: control/forward/backward all expected IDENTITY acquired (fallback runs, monotonic deadline immune to wall-clock shift)."
 
@@ -70,6 +71,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          $env:PROC_SAFE_NATIVE = "off"   # force fallback path (native binding absent = sealed helper scenario)
           $src = "src/infra/windows-process-start.ts"
           Copy-Item $src "$src.postfix.bak"
           # Revert performance.now() -> Date.now() and drop Math.ceil (pre-fix behavior)
@@ -81,7 +83,7 @@ jobs:
           Write-Host "=== PR #184162 Windows Native Proof (pre-fix: Date.now) ==="
           Write-Host "deadline line: $((Select-String -Path $src -Pattern 'const deadline =').Line.Trim())"
           Write-Host ""
-          node --import tsx/esm --import ./proofs/184162/force-native-unavailable.mjs proofs/184162/proof-184162-windows.ts
+          node --import tsx/esm proofs/184162/proof-184162-windows.ts
           Write-Host ""
           Write-Host "pre-fix: forward jump expected NO_IDENTITY (fallback skipped, healthy probe killed); backward jump expected inflated budget."
           Copy-Item "$src.postfix.bak" $src -Force

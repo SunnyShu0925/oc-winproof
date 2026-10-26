@@ -1,9 +1,10 @@
 // PR #184162 real Windows production-owner proof.
 //
 // Runs the SHIPPED readWindowsProcessStartTimeSync against a REAL running
-// child process on a Windows runner. Native identity is forced unavailable
-// (via --import force-native-unavailable.mjs) so the PowerShell and WMIC
-// FALLBACK execute real subprocesses — the path this PR repairs. A wall-clock
+// child process on a Windows runner. Native identity is made unavailable
+// (PROC_SAFE_NATIVE=off, the same helper-absent state sealed updater helpers
+// run in) so the PowerShell and WMIC FALLBACK execute real subprocesses — the
+// path this PR repairs. A wall-clock
 // jump (NTP correction) is injected on Date.now ONLY, leaving the monotonic
 // clock intact, to show:
 //   - post-fix (performance.now deadline): forward/backward jumps do not affect
