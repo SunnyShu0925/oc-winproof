@@ -129,5 +129,21 @@ if ($stillListening) {
   Write-Host "VERDICT[$Label]: STOP_REFUSED exit=$stopCode port released"
 }
 
+# Control: the SAME build and the SAME still-running Gateway, stopped again
+# without any clock step. This isolates the wall-clock step as the cause.
+Write-Host ""
+Write-Host "=== $Label :: openclaw gateway stop (control, no clock step) ==="
+$controlOut = (& node openclaw.mjs gateway stop --force --json 2>&1 | Out-String)
+$controlCode = $LASTEXITCODE
+Write-Host "control exit=$controlCode"
+Write-Host $controlOut
+Start-Sleep -Seconds 3
+$controlListening = netstat -ano | Select-String ":$port\s" | Select-String "LISTENING"
+if ($controlListening) {
+  Write-Host "CONTROL[$Label]: CONTROL_FAILED gateway still listening on $port"
+} else {
+  Write-Host "CONTROL[$Label]: CONTROL_STOPPED plain stop released $port"
+}
+
 Remove-Service
 Write-Host "################ END SCENARIO $Label ################"
