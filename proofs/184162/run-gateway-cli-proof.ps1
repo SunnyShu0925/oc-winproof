@@ -16,12 +16,17 @@ $ErrorActionPreference = "Continue"
 $root = (Get-Location).Path
 $port = 19123
 $taskName = "OpenClaw Gateway"
-$stateDir = Join-Path $env:RUNNER_TEMP ("oc-state-" + $Label)
+# `gateway install` refuses a non-canonical state dir, so use the account home
+# default (%USERPROFILE%\.openclaw) and wipe it between scenarios.
+$stateDir = Join-Path $env:USERPROFILE ".openclaw"
 
 function Reset-State {
+  # Install requires canonical paths for this account home.
+  Remove-Item Env:OPENCLAW_STATE_DIR -ErrorAction SilentlyContinue
+  Remove-Item Env:OPENCLAW_CONFIG_PATH -ErrorAction SilentlyContinue
+  Remove-Item Env:OPENCLAW_HOME -ErrorAction SilentlyContinue
   if (Test-Path $stateDir) { Remove-Item -Recurse -Force $stateDir -ErrorAction SilentlyContinue }
   New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
-  $env:OPENCLAW_STATE_DIR = $stateDir
   $env:PROC_SAFE_NATIVE = "off"   # force the PowerShell/WMIC identity fallback (no native helper)
   Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 }
@@ -52,7 +57,10 @@ function Dump-Diagnostics {
   Get-ChildItem -Recurse -File $stateDir -ErrorAction SilentlyContinue |
     Select-Object -First 40 |
     ForEach-Object { Write-Host "    $($_.FullName) ($($_.Length) bytes)" }
-  $logs = Get-ChildItem -Recurse -File $stateDir -Include *.log,*.jsonl -ErrorAction SilentlyContinue
+  $logDirs = @($stateDir, (Join-Path $env:TEMP "openclaw"))
+  $logs = foreach ($dir in $logDirs) {
+    Get-ChildItem -Recurse -File $dir -Include *.log,*.jsonl -ErrorAction SilentlyContinue
+  }
   foreach ($log in $logs) {
     Write-Host "  [diag] tail $($log.FullName):"
     Get-Content $log.FullName -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
