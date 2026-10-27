@@ -1,0 +1,131 @@
+name: Windows Settlement Clock Proof (PR #185577 monotonic settlement deadline)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/schtasks-state-probe-settlement-monotonic"
+
+jobs:
+  windows-proof:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path proofs/185577 | Out-Null
+          Copy-Item ../oc-winproof/proofs/185577/* proofs/185577/
+          Get-ChildItem proofs/185577 | Select-Object Name, Length
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Confirm runtime
+        shell: pwsh
+        run: |
+          Write-Host "Node: $(node --version)"
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+
+      - name: Run PR #185577 proof (post-fix: performance.now deadline, +280s)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== PR #185577 Windows Settlement Clock Proof (post-fix: performance.now, +280s) ==="
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "Node: $(node --version)"
+          Write-Host "deadline line: $((Select-String -Path src/daemon/schtasks-state-probe.ts -Pattern 'const deadline =').Line.Trim())"
+          Write-Host ""
+          $env:PROOF_SHIFT_MS = "280000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "post-fix +280s: expected probe timeout 60000 (budget preserved)"
+
+      - name: Run PR #185577 proof (post-fix: +380s)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== PR #185577 post-fix +380s (past the 330s stop budget) ==="
+          $env:PROOF_SHIFT_MS = "380000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "post-fix +380s: expected probe timeout 60000 (budget preserved even past the roll)"
+
+      - name: Run PR #185577 proof (pre-fix: Date.now deadline reverted, +280s)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "src/daemon/schtasks-state-probe.ts"
+          Copy-Item $src "$src.postfix.bak"
+          # Revert all six performance.now() reads back to Date.now() (pre-fix behavior)
+          $content = Get-Content $src -Raw
+          $content = $content -replace 'const deadline = performance\.now\(\) \+ GATEWAY_SERVICE_STOP_TIMEOUT_MS;', 'const deadline = Date.now() + GATEWAY_SERVICE_STOP_TIMEOUT_MS;'
+          $content = $content -replace 'const remaining = Math\.max\(1, deadline - performance\.now\(\)\);', 'const remaining = Math.max(1, deadline - Date.now());'
+          $content = $content -replace 'performance\.now\(\) >= deadline', 'Date.now() >= deadline'
+          Set-Content $src -Value $content -NoNewline -Encoding utf8
+          Write-Host "=== PR #185577 pre-fix (Date.now deadline reverted) +280s ==="
+          Write-Host "deadline line: $((Select-String -Path $src -Pattern 'const deadline =').Line.Trim())"
+          Write-Host ""
+          $env:PROOF_SHIFT_MS = "280000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "pre-fix +280s: expected probe timeout 50000 (budget collapsed by 280s jump)"
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Run PR #185577 proof (pre-fix: +380s)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "src/daemon/schtasks-state-probe.ts"
+          Copy-Item $src "$src.postfix.bak"
+          $content = Get-Content $src -Raw
+          $content = $content -replace 'const deadline = performance\.now\(\) \+ GATEWAY_SERVICE_STOP_TIMEOUT_MS;', 'const deadline = Date.now() + GATEWAY_SERVICE_STOP_TIMEOUT_MS;'
+          $content = $content -replace 'const remaining = Math\.max\(1, deadline - performance\.now\(\)\);', 'const remaining = Math.max(1, deadline - Date.now());'
+          $content = $content -replace 'performance\.now\(\) >= deadline', 'Date.now() >= deadline'
+          Set-Content $src -Value $content -NoNewline -Encoding utf8
+          Write-Host "=== PR #185577 pre-fix +380s (past the 330s stop budget) ==="
+          Write-Host ""
+          $env:PROOF_SHIFT_MS = "380000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "pre-fix +380s: expected probe timeout 1ms (budget collapsed to nothing past the roll)"
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Upload proof output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-settlement-proof-185577-output
+          path: |
+            openclaw/proofs/185577/proof-185577-windows.mjs
+            openclaw/src/daemon/schtasks-state-probe.ts
+          retention-days: 30
+          if-no-files-found: warn
