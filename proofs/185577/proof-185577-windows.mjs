@@ -49,7 +49,7 @@ const probeMod = await import(
 const { prepareScheduledTaskSettlement } = probeMod;
 
 // ---- Ensure a REAL Scheduled Task exists (state=Ready, non-empty LastTaskResult) ----
-function ensureTask() {
+async function ensureTask() {
   const r = cp.spawnSync(
     "schtasks.exe",
     [
@@ -95,7 +95,7 @@ function armClockShift() {
 // ---- Run one settlement under the current (source) build ----
 async function runScenario(label) {
   probeTimeouts.length = 0;
-  ensureTask();
+  await ensureTask();
   await sleep(1500);
 
   console.log("");
