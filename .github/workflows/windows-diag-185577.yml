@@ -58,11 +58,29 @@ jobs:
           Write-Host "dist/entry.js exists: $(Test-Path dist/entry.js)"
           node openclaw.mjs --version
 
-      - name: Diag scenario pre-fix (install + stop with diag preload)
+      - name: Patch source to pre-fix (Date.now) behavior
+        shell: pwsh
+        run: |
+          $src = "src/daemon/schtasks-state-probe.ts"
+          $c = Get-Content $src -Raw
+          $c = $c.Replace('const deadline = performance.now() + GATEWAY_SERVICE_STOP_TIMEOUT_MS;', 'const deadline = Date.now() + GATEWAY_SERVICE_STOP_TIMEOUT_MS;')
+          $c = $c.Replace('const remaining = Math.max(1, deadline - performance.now());', 'const remaining = Math.max(1, deadline - Date.now());')
+          $c = $c.Replace('performance.now() >= deadline', 'Date.now() >= deadline')
+          $c = $c.Replace('await sleep(Math.min(100, deadline - performance.now()));', 'await sleep(Math.min(100, deadline - Date.now()));')
+          Set-Content $src -Value $c -NoNewline -Encoding utf8
+          Write-Host "pre-fix deadline lines:"
+          Select-String -Path $src -Pattern 'deadline = |Date.now|performance.now' | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+
+      - name: Rebuild CLI (pre-fix)
+        continue-on-error: true
+        run: pnpm build cliStartup
+
+      - name: Diag scenario pre-fix +380s (install + stop with diag preload)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          pwsh -NoProfile -File proofs/185577-shipped/run-gateway-settlement-proof.ps1 -Label diag-prefix -Inject -Diag
+          $env:PROOF_SHIFT_MS = "380000"
+          pwsh -NoProfile -File proofs/185577-shipped/run-gateway-settlement-proof.ps1 -Label diag-prefix-380 -Inject -Diag
 
       - name: Upload proof scripts + dist
         if: always()
