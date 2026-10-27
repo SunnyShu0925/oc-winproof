@@ -67,6 +67,16 @@ jobs:
           Write-Host ""
           Write-Host "post-fix +280s: expected probe timeout 60000 (budget preserved)"
 
+      - name: Run PR #185577 proof (post-fix: -280s backward jump)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== PR #185577 post-fix -280s backward (wall-clock steps backward) ==="
+          $env:PROOF_SHIFT_MS = "-280000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "post-fix -280s: expected probe timeout 60000 (backward jump inert)"
+
       - name: Run PR #185577 proof (post-fix: +380s)
         shell: pwsh
         run: |
@@ -116,6 +126,26 @@ jobs:
           node --import tsx/esm proofs/185577/proof-185577-windows.mjs
           Write-Host ""
           Write-Host "pre-fix +380s: expected probe timeout 1ms (budget collapsed to nothing past the roll)"
+          Copy-Item "$src.postfix.bak" $src -Force
+          Remove-Item "$src.postfix.bak" -Force
+
+      - name: Run PR #185577 proof (pre-fix: -280s backward jump)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "src/daemon/schtasks-state-probe.ts"
+          Copy-Item $src "$src.postfix.bak"
+          $content = Get-Content $src -Raw
+          $content = $content -replace 'const deadline = performance\.now\(\) \+ GATEWAY_SERVICE_STOP_TIMEOUT_MS;', 'const deadline = Date.now() + GATEWAY_SERVICE_STOP_TIMEOUT_MS;'
+          $content = $content -replace 'const remaining = Math\.max\(1, deadline - performance\.now\(\)\);', 'const remaining = Math.max(1, deadline - Date.now());'
+          $content = $content -replace 'performance\.now\(\) >= deadline', 'Date.now() >= deadline'
+          Set-Content $src -Value $content -NoNewline -Encoding utf8
+          Write-Host "=== PR #185577 pre-fix -280s backward (settlement over-waits) ==="
+          Write-Host ""
+          $env:PROOF_SHIFT_MS = "-280000"
+          node --import tsx/esm proofs/185577/proof-185577-windows.mjs
+          Write-Host ""
+          Write-Host "pre-fix -280s: expected remaining budget 610000 (inflated; backward jump stretches the settlement window)"
           Copy-Item "$src.postfix.bak" $src -Force
           Remove-Item "$src.postfix.bak" -Force
 
