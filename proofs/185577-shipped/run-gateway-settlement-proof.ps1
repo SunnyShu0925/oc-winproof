@@ -116,6 +116,14 @@ Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 Write-Host "stop exit=$stopCode elapsed=${stopElapsed}s"
 Write-Host $stopOut
 
+# Extract the settlement probe budget the shipped stop handed to the REAL
+# PowerShell probe (written to stderr by the preload).
+$steppedLine = ($stopOut | Select-String "settlement Date.now reads stepped:" | Select-Object -First 1).ToString()
+$probeLine   = ($stopOut | Select-String "settlement probe timeouts observed:" | Select-Object -First 1).ToString()
+$steppedCount = if ($steppedLine -match 'stepped: (\d+)') { [int]$Matches[1] } else { -1 }
+$probeTimeouts = if ($probeLine -match '\[([^\]]*)\]') { $Matches[1] } else { "" }
+Write-Host "PROBE[${Label}]: settlement Date.now stepped=$steppedCount ; probe timeouts=[$probeTimeouts]"
+
 Start-Sleep -Seconds 4
 $stillListening = netstat -ano | Select-String ":$port\s" | Select-String "LISTENING"
 if ($stillListening) {
