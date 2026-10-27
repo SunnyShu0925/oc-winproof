@@ -116,13 +116,13 @@ Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 Write-Host "stop exit=$stopCode elapsed=${stopElapsed}s"
 Write-Host $stopOut
 
-# Extract the settlement probe budget the shipped stop handed to the REAL
-# PowerShell probe (written to stderr by the preload).
+# Extract whether the shipped stop's settlement clock reads were shifted by the
+# preload (stderr of the stop subprocess). pre-fix shifts them (wall clock is
+# stepped) and can push the probe budget to 1ms -> settlement unavailable ->
+# stop unverified. post-fix never reaches Date.now() in the owner (monotonic).
 $steppedLine = ($stopOut | Select-String "settlement Date.now reads stepped:" | Select-Object -First 1).ToString()
-$probeLine   = ($stopOut | Select-String "settlement probe timeouts observed:" | Select-Object -First 1).ToString()
 $steppedCount = if ($steppedLine -match 'stepped: (\d+)') { [int]$Matches[1] } else { -1 }
-$probeTimeouts = if ($probeLine -match '\[([^\]]*)\]') { $Matches[1] } else { "" }
-Write-Host "PROBE[${Label}]: settlement Date.now stepped=$steppedCount ; probe timeouts=[$probeTimeouts]"
+Write-Host "PROBE[${Label}]: settlement Date.now reads stepped=$steppedCount"
 
 Start-Sleep -Seconds 4
 $stillListening = netstat -ano | Select-String ":$port\s" | Select-String "LISTENING"
