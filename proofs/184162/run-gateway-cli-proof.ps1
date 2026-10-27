@@ -105,7 +105,9 @@ Write-Host "status exit=$LASTEXITCODE"
 Write-Host $statusOut
 
 if ($Inject) {
-  $env:NODE_OPTIONS = "--import " + (Join-Path $root "proofs/184162/cli-clock-shift.mjs")
+  # NODE_OPTIONS on Windows needs a file:// URL, not a drive-letter path.
+  $modulePath = ((Join-Path $root "proofs/184162/cli-clock-shift.mjs") -replace '\\', '/')
+  $env:NODE_OPTIONS = "--import file:///$modulePath"
   $env:PROOF_SHIFT_MS = "10000"
 }
 Write-Host ""
