@@ -30,10 +30,15 @@
 const realNow = Date.now;
 const shiftMs = Number(process.env.PROOF_SHIFT_MS ?? "0");
 
+// The settlement owner is a closure returned by prepareScheduledTaskSettlement:
+// once invoked, that function is already off the stack, so its name never
+// appears in the probe's call stack. The closure's frames DO carry their source
+// location in src/daemon/schtasks-state-probe.ts (pre-fix builds read Date.now
+// only inside that closure, lines ~345-373). Match the source file.
 const settlementPatterns = [
+  "schtasks-state-probe.ts",
   "prepareScheduledTaskSettlement",
   "ScheduledTaskSettlement",
-  "settlement-owner",
 ];
 
 function inSettlementStack(stack) {
