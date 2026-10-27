@@ -10,7 +10,7 @@
 // (wall clock) to performance.now() (monotonic). This preload:
 //
 //   1. Shifts Date.now() only while the call stack is inside the settlement
-//      owner (bundled: the service-state chunk; source: schtasks-state-probe.ts).
+//      owner (bundled: the schtasks-layout chunk; source: schtasks-state-probe.ts).
 //      Within a SINGLE function invocation the FIRST Date.now read is the
 //      deadline seed (returned real); every later read in that same invocation
 //      is returned real+shift, collapsing the remaining-budget probe timeout.
@@ -33,11 +33,11 @@ const realNow = Date.now;
 const shiftMs = Number(process.env.PROOF_SHIFT_MS ?? "0");
 
 const settlementPatterns = [
-  // Bundled runtime: settlement owner + terminate/waitForProcessExit all live in
-  // the service-state chunk. Match the stable filename prefix (trailing hash
-  // varies between builds).
+  // Bundled runtime: settlement owner + terminate/waitForProcessExit live in
+  // the service-state chunk; the owner's own Date.now reads appear in the
+  // schtasks-layout chunk (its bundle home). Match both prefixes.
+  "schtasks-layout-",
   "service-state-",
-  // Source / tsx mode fallback:
   "schtasks-state-probe.ts",
   "prepareScheduledTaskSettlement",
   "ScheduledTaskSettlement",
@@ -55,7 +55,6 @@ function invocationIdentity(stack) {
     if (i === 2) continue; // skip the innermost caller; use its caller
     return line;
   }
-  // Fallback: use the innermost caller.
   for (let i = 2; i < lines.length && i < 4; i++) {
     const line = lines[i].trim();
     if (line && !line.includes("cli-clock-shift-settlement.mjs")) return line;
@@ -66,6 +65,7 @@ function invocationIdentity(stack) {
 let lastIdentity = "";
 let seedSeen = false;
 let stepped = 0;
+let logged = false;
 
 Date.now = function proofShiftedDateNow() {
   let stack = "";
@@ -80,16 +80,26 @@ Date.now = function proofShiftedDateNow() {
     return realNow();
   }
   const identity = invocationIdentity(stack);
-  if (identity !== lastIdentity) {
-    // New invocation entered the matching region -> this read is the seed.
+  const fresh = identity !== lastIdentity;
+  if (fresh) {
     lastIdentity = identity;
     seedSeen = false;
   }
   if (!seedSeen) {
     seedSeen = true;
+    if (!logged || fresh) {
+      process.stderr.write(
+        `[proof-inject] SEED(real) id=[${identity.slice(0, 90)}]\n`,
+      );
+    }
     return realNow();
   }
   stepped += 1;
+  if (stepped <= 12) {
+    process.stderr.write(
+      `[proof-inject] STEP +${shiftMs} id=[${identity.slice(0, 90)}]\n`,
+    );
+  }
   return realNow() + shiftMs;
 };
 
