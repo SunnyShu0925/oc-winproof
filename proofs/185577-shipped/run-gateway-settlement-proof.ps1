@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory = $true)][string]$Label,
-  [switch]$Inject
+  [switch]$Inject,
+  [switch]$Diag
 )
 
 # PR #185577 shipped-command settlement proof.
@@ -99,7 +100,13 @@ $statusOut = (& node openclaw.mjs gateway status --json --timeout 5000 2>&1 | Ou
 Write-Host "status exit=$LASTEXITCODE"
 Write-Host $statusOut
 
-if ($Inject) {
+if ($Diag) {
+  # Diagnostic: dump the stack of every Date.now() call to see how the
+  # settlement closure appears inside the bundled dist.
+  $modulePath = ((Join-Path $root "proofs/185577-shipped/diag-stack.mjs") -replace '\\', '/')
+  $env:NODE_OPTIONS = "--import file:///$modulePath"
+  $env:PROOF_SHIFT_MS = "$env:PROOF_SHIFT_MS"
+} elseif ($Inject) {
   # NODE_OPTIONS on Windows needs a file:// URL, not a drive-letter path.
   $modulePath = ((Join-Path $root "proofs/185577-shipped/cli-clock-shift-settlement.mjs") -replace '\\', '/')
   $env:NODE_OPTIONS = "--import file:///$modulePath"

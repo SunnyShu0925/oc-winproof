@@ -1,0 +1,77 @@
+name: Windows Settlement Diag (PR #185577)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/schtasks-state-probe-settlement-monotonic"
+
+jobs:
+  windows-settlement-diag:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path proofs/185577-shipped | Out-Null
+          Copy-Item ../oc-winproof/proofs/185577-shipped/* proofs/185577-shipped/
+          Get-ChildItem proofs/185577-shipped | Select-Object Name, Length
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI
+        continue-on-error: true
+        run: pnpm build cliStartup
+
+      - name: Verify shipped CLI
+        shell: pwsh
+        run: |
+          Write-Host "dist/entry.js exists: $(Test-Path dist/entry.js)"
+          node openclaw.mjs --version
+
+      - name: Diag scenario pre-fix (install + stop with diag preload)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          pwsh -NoProfile -File proofs/185577-shipped/run-gateway-settlement-proof.ps1 -Label diag-prefix -Inject -Diag
+
+      - name: Upload proof scripts + dist
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-settlement-diag-185577
+          path: |
+            openclaw/proofs/185577-shipped/
+            openclaw/dist/entry.js
+            openclaw/src/daemon/schtasks-state-probe.ts
+          retention-days: 30
+          if-no-files-found: warn
