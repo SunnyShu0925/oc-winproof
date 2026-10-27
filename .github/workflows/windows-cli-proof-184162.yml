@@ -1,0 +1,118 @@
+name: Windows Shipped-CLI Proof (PR #184162 Windows process-start deadline)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/bug-137-windows-process-start-deadline-wall-clock"
+
+jobs:
+  windows-cli-proof:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: openclaw
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path proofs/184162 | Out-Null
+          Copy-Item ../oc-winproof/proofs/184162/* proofs/184162/
+          Get-ChildItem proofs/184162 | Select-Object Name, Length
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Confirm checkout
+        shell: pwsh
+        run: |
+          Write-Host "HEAD: $(git rev-parse HEAD)"
+          Write-Host "Node: $(node --version)"
+          Write-Host "Platform: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "deadline line: $((Select-String -Path src/infra/windows-process-start.ts -Pattern 'const deadline =').Line.Trim())"
+
+      - name: Build CLI (post-fix)
+        continue-on-error: true
+        run: pnpm build cliStartup
+
+      - name: Verify shipped CLI entry
+        shell: pwsh
+        run: |
+          Write-Host "dist/entry.js exists: $(Test-Path dist/entry.js)"
+          node openclaw.mjs --version
+          Write-Host "cli exit=$LASTEXITCODE"
+
+      - name: Scenario post-fix (shipped CLI, wall clock steps forward)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          pwsh -NoProfile -File proofs/184162/run-gateway-cli-proof.ps1 -Label post-fix -Inject
+
+      - name: Patch source to pre-fix (Date.now) behavior
+        shell: pwsh
+        run: |
+          $src = "src/infra/windows-process-start.ts"
+          Copy-Item $src "$src.postfix.bak"
+          $c = Get-Content $src -Raw
+          $c = $c.Replace('const deadline = performance.now() + timeoutMs;', 'const deadline = Date.now() + timeoutMs;')
+          $c = $c.Replace('const powershellBudgetMs = Math.ceil(deadline - performance.now());', 'const powershellBudgetMs = deadline - Date.now();')
+          $c = $c.Replace('const remainingMs = Math.ceil(deadline - performance.now());', 'const remainingMs = deadline - Date.now();')
+          Set-Content $src -Value $c -NoNewline -Encoding utf8
+          Write-Host "pre-fix reader lines:"
+          Select-String -Path $src -Pattern 'deadline - |const deadline =' | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+
+      - name: Build CLI (pre-fix)
+        continue-on-error: true
+        run: pnpm build cliStartup
+
+      - name: Scenario pre-fix (shipped CLI, wall clock steps forward)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          pwsh -NoProfile -File proofs/184162/run-gateway-cli-proof.ps1 -Label pre-fix -Inject
+
+      - name: Restore source
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "src/infra/windows-process-start.ts.postfix.bak") {
+            Copy-Item "src/infra/windows-process-start.ts.postfix.bak" "src/infra/windows-process-start.ts" -Force
+            Remove-Item "src/infra/windows-process-start.ts.postfix.bak" -Force
+          }
+          git status -sb
+
+      - name: Upload proof scripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cli-proof-184162
+          path: |
+            openclaw/proofs/184162/
+            openclaw/src/infra/windows-process-start.ts
+          retention-days: 30
+          if-no-files-found: warn
