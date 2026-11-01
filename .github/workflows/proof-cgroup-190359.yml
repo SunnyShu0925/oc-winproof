@@ -1,0 +1,135 @@
+name: Cgroup placement proof (PR 190359)
+
+# Real-behavior proof that shell snapshot capture/validation subprocesses land
+# in the agent-exec cgroup (post-fix) vs the gateway cgroup (pre-fix) on an
+# isolated Linux runner with delegated cgroup v2 + spawn broker enabled.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/shell-snapshot-exec-intent-277"
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 0
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof script into openclaw tree
+        run: |
+          mkdir -p openclaw/proofs/190359
+          cp oc-winproof/proofs/190359/proof-snapshot-cgroup.mjs openclaw/proofs/190359/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        working-directory: openclaw
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify source tree loads (no dist build needed; broker worker runs from source via tsx)
+        working-directory: openclaw
+        run: node --import tsx/esm -e "import('./src/agents/shell-snapshot.js').then(m=>console.log('snapshot module keys:', Object.keys(m).length))"
+
+      - name: Setup cgroup v2 delegation
+        run: |
+          set -x
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          # Propagate io from user.slice down to user@1001.service and app.slice
+          # so the delegated service subtree sees cpu+io+memory controllers.
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control' 2>&1 || true
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || true
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || true
+          USERSVC="/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service"
+          sudo bash -c "echo '+io +cpu +memory' > '$USERSVC/app.slice/cgroup.subtree_control'" 2>&1 || true
+          echo "app.slice controllers: $(cat $USERSVC/app.slice/cgroup.controllers)"
+
+      - name: Run post-fix proof (PR head)
+        run: |
+          set -x
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-proof-state"
+          export HOME="$RUNNER_TEMP/oc-proof-home"
+          mkdir -p "$OPENCLAW_STATE_DIR" "$HOME"
+          chmod 700 "$OPENCLAW_STATE_DIR" "$HOME"
+          export PROOF_LOG="$RUNNER_TEMP/proof-postfix.log"
+          # Run inside a delegated transient unit so the process lands in
+          # <service>/gateway leaf (matches resolveGatewayServiceCgroupDirectory).
+          systemd-run --user --unit=oc-proof-postfix \
+            --property=Delegate=yes --property=DelegateSubgroup=gateway \
+            --working-directory="$GITHUB_WORKSPACE/openclaw" \
+            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
+            --setenv=HOME="$HOME" \
+            --setenv=PROOF_LOG="$PROOF_LOG" \
+            --setenv=PATH="$PATH" \
+            bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
+            > "$RUNNER_TEMP/postfix-stdout.log" 2>&1 || true
+          sleep 2
+          echo "=== post-fix stdout ==="
+          cat "$RUNNER_TEMP/postfix-stdout.log" || true
+          echo "=== post-fix proof log ==="
+          cat "$PROOF_LOG" || true
+          journalctl --user -u oc-proof-postfix --no-pager -n 50 2>&1 || true
+          systemctl --user stop oc-proof-postfix 2>&1 || true
+
+      - name: Run pre-fix proof (main, revert the one-line fix)
+        run: |
+          set -x
+          cd openclaw
+          # Revert the fix: fetch main and check out its shell-snapshot.ts.
+          git fetch origin main 2>&1 || true
+          git checkout origin/main -- src/agents/shell-snapshot.ts 2>&1 || true
+          git diff --stat 2>&1 || true
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-proof-state-pre"
+          export HOME="$RUNNER_TEMP/oc-proof-home-pre"
+          mkdir -p "$OPENCLAW_STATE_DIR" "$HOME"
+          chmod 700 "$OPENCLAW_STATE_DIR" "$HOME"
+          export PROOF_LOG="$RUNNER_TEMP/proof-prefix.log"
+          systemd-run --user --unit=oc-proof-prefix \
+            --property=Delegate=yes --property=DelegateSubgroup=gateway \
+            --working-directory="$GITHUB_WORKSPACE/openclaw" \
+            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
+            --setenv=HOME="$HOME" \
+            --setenv=PROOF_LOG="$PROOF_LOG" \
+            --setenv=PATH="$PATH" \
+            bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
+            > "$RUNNER_TEMP/prefix-stdout.log" 2>&1 || true
+          sleep 2
+          echo "=== pre-fix stdout ==="
+          cat "$RUNNER_TEMP/prefix-stdout.log" || true
+          echo "=== pre-fix proof log ==="
+          cat "$PROOF_LOG" || true
+          journalctl --user -u oc-proof-prefix --no-pager -n 50 2>&1 || true
+          systemctl --user stop oc-proof-prefix 2>&1 || true
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cgroup-proof-logs
+          path: |
+            ${{ runner.temp }}/proof-postfix.log
+            ${{ runner.temp }}/proof-prefix.log
+            ${{ runner.temp }}/*-stdout.log
