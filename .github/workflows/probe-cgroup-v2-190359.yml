@@ -1,7 +1,7 @@
-name: Probe io full chain (PR 190359)
+name: Probe io via sudo root (PR 190359)
 
-# Enable io from user.slice down to user@1001.service so a delegated transient
-# service subtree sees cpu+io+memory (required by resolveGatewayServiceCgroupDirectory).
+# user.slice/cgroup.subtree_control needs root to write io. Use sudo there,
+# then propagate down to user-1001.slice and user@1001.service.
 on:
   workflow_dispatch:
 
@@ -10,25 +10,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Enable io down the user cgroup chain
+      - name: Enable io via sudo from user.slice down
         run: |
           set -x
           sudo loginctl enable-linger "$USER"
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          # user.slice is writable by runner; enable io there first.
-          echo "user.slice before: $(cat /sys/fs/cgroup/user.slice/cgroup.subtree_control)"
-          echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control 2>&1 || echo "user.slice failed"
+          echo "user.slice controllers: $(cat /sys/fs/cgroup/user.slice/cgroup.controllers)"
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control' 2>&1 || echo "user.slice FAILED"
           echo "user.slice after: $(cat /sys/fs/cgroup/user.slice/cgroup.subtree_control)"
-          # Now user-1001.slice should have io available; enable it down.
           echo "user-1001.slice controllers: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.controllers)"
-          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || echo "user-1001.slice failed"
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || echo "user-1001.slice FAILED"
           echo "user-1001.slice after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control)"
-          # Now user@1001.service.
           echo "user@1001.service controllers: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers)"
-          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || echo "user@1001.service failed"
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || echo "user@1001.service FAILED"
           echo "user@1001.service after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control)"
           echo "user@1001.service controllers after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers)"
-          # Run a delegated transient unit and inspect its service root controllers.
           cat > /tmp/p.sh <<'P'
           REL="$(cat /proc/self/cgroup | sed 's/^0:://')"
           ROOT="/sys/fs/cgroup$(dirname "$REL")"
@@ -36,13 +32,12 @@ jobs:
           echo "IN-UNIT service root: $ROOT"
           echo "IN-UNIT controllers: $(cat "$ROOT/cgroup.controllers")"
           echo "IN-UNIT subtree_control: $(cat "$ROOT/cgroup.subtree_control" 2>&1)"
-          echo "IN-UNIT gateway procs writable? $(test -w "$ROOT/gateway/cgroup.procs" && echo YES || echo NO)"
           echo "IN-UNIT subtree_control writable? $(test -w "$ROOT/cgroup.subtree_control" && echo YES || echo NO)"
-          echo "IN-UNIT gateway procs: $(cat "$ROOT/gateway/cgroup.procs" 2>&1)"
+          echo "IN-UNIT gateway procs writable? $(test -w "$ROOT/gateway/cgroup.procs" && echo YES || echo NO)"
           echo "IN-UNIT svc root procs: [$(cat "$ROOT/cgroup.procs" 2>&1)]"
           P
-          systemd-run --user --unit=probe-io3 --property=Delegate=yes --property=DelegateSubgroup=gateway bash /tmp/p.sh 2>&1
+          systemd-run --user --unit=probe-io4 --property=Delegate=yes --property=DelegateSubgroup=gateway bash /tmp/p.sh 2>&1
           sleep 3
-          journalctl --user -u probe-io3 --no-pager -n 30 2>&1 || true
-          systemctl --user stop probe-io3 2>&1 || true
+          journalctl --user -u probe-io4 --no-pager -n 30 2>&1 || true
+          systemctl --user stop probe-io4 2>&1 || true
           echo "=== DONE ==="
