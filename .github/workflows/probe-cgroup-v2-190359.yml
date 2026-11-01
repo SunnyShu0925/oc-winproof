@@ -1,7 +1,8 @@
-name: Probe io via sudo root (PR 190359)
+name: Probe io to app.slice (PR 190359)
 
-# user.slice/cgroup.subtree_control needs root to write io. Use sudo there,
-# then propagate down to user-1001.slice and user@1001.service.
+# io reached user@1001.service but transient units land under app.slice which
+# does not delegate io. Enable io on app.slice (and session.slice) so the
+# delegated service root sees cpu+io+memory.
 on:
   workflow_dispatch:
 
@@ -10,21 +11,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Enable io via sudo from user.slice down
+      - name: Enable io down to app.slice
         run: |
           set -x
           sudo loginctl enable-linger "$USER"
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          echo "user.slice controllers: $(cat /sys/fs/cgroup/user.slice/cgroup.controllers)"
-          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control' 2>&1 || echo "user.slice FAILED"
-          echo "user.slice after: $(cat /sys/fs/cgroup/user.slice/cgroup.subtree_control)"
-          echo "user-1001.slice controllers: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.controllers)"
-          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || echo "user-1001.slice FAILED"
-          echo "user-1001.slice after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control)"
-          echo "user@1001.service controllers: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers)"
-          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || echo "user@1001.service FAILED"
-          echo "user@1001.service after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control)"
-          echo "user@1001.service controllers after: $(cat /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers)"
+          # Propagate io from user.slice down.
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control' 2>&1 || true
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || true
+          sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || true
+          # Enable io on app.slice and session.slice (children of user@1001.service).
+          USERSVC="/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service"
+          for child in app.slice session.slice; do
+            echo "$child controllers: $(cat $USERSVC/$child/cgroup.controllers)"
+            sudo bash -c "echo '+io +cpu +memory' > '$USERSVC/$child/cgroup.subtree_control'" 2>&1 || echo "$child FAILED"
+            echo "$child after: $(cat $USERSVC/$child/cgroup.subtree_control)"
+          done
           cat > /tmp/p.sh <<'P'
           REL="$(cat /proc/self/cgroup | sed 's/^0:://')"
           ROOT="/sys/fs/cgroup$(dirname "$REL")"
@@ -35,9 +37,10 @@ jobs:
           echo "IN-UNIT subtree_control writable? $(test -w "$ROOT/cgroup.subtree_control" && echo YES || echo NO)"
           echo "IN-UNIT gateway procs writable? $(test -w "$ROOT/gateway/cgroup.procs" && echo YES || echo NO)"
           echo "IN-UNIT svc root procs: [$(cat "$ROOT/cgroup.procs" 2>&1)]"
+          echo "IN-UNIT svc root procs empty? $(test -z "$(cat "$ROOT/cgroup.procs" 2>&1)" && echo YES || echo NO)"
           P
-          systemd-run --user --unit=probe-io4 --property=Delegate=yes --property=DelegateSubgroup=gateway bash /tmp/p.sh 2>&1
+          systemd-run --user --unit=probe-io5 --property=Delegate=yes --property=DelegateSubgroup=gateway bash /tmp/p.sh 2>&1
           sleep 3
-          journalctl --user -u probe-io4 --no-pager -n 30 2>&1 || true
-          systemctl --user stop probe-io4 2>&1 || true
+          journalctl --user -u probe-io5 --no-pager -n 30 2>&1 || true
+          systemctl --user stop probe-io5 2>&1 || true
           echo "=== DONE ==="
