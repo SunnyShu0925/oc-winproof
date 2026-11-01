@@ -1,0 +1,51 @@
+name: Probe cgroup v2 delegation (PR 190359)
+
+# Feasibility probe: can a GHA ubuntu-24.04 runner create a systemd user
+# service with Delegate=yes/DelegateSubgroup=gateway, start a process in it,
+# and observe the gateway/agent-exec cgroup leaves?
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe cgroup v2 + systemd delegation
+        run: |
+          set -x
+          echo "=== systemd version ==="
+          systemctl --version | head -1
+          echo "=== cgroup version (self) ==="
+          cat /proc/self/cgroup
+          echo "=== cgroup fs type ==="
+          stat -fc %T /sys/fs/cgroup
+          echo "=== cgroup.controllers ==="
+          cat /sys/fs/cgroup/cgroup.controllers
+          echo "=== enable linger ==="
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          echo "=== systemd-run --user with Delegate ==="
+          # Try a transient unit with delegation; the process writes its own
+          # cgroup path so we can inspect placement.
+          cat > /tmp/probe-delegate.sh <<'PROBE'
+          set -x
+          echo "probe-delegate cgroup: $(cat /proc/self/cgroup)"
+          # The transient unit's cgroup leaf should be under the user manager.
+          ls -la /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/ 2>&1 | head
+          sleep 2
+          PROBE
+          chmod +x /tmp/probe-delegate.sh
+          systemd-run --user --unit=probe-delegate --property=Delegate=yes --property=DelegateSubgroup=gateway /tmp/probe-delegate.sh 2>&1 || true
+          sleep 3
+          echo "=== probe-delegate status ==="
+          systemctl --user status probe-delegate --no-pager 2>&1 | head -20 || true
+          echo "=== user service cgroup tree ==="
+          CGROOT="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
+          ls -la "$CGROOT" 2>&1 | head -20
+          echo "=== try creating agent-exec leaf manually ==="
+          # systemd with DelegateSubgroup=gateway should have created gateway leaf
+          ls -la "$CGROOT/gateway" 2>&1 | head
+          echo "=== can we enable controllers on user service root? ==="
+          cat "$CGROOT/cgroup.controllers" 2>&1
+          echo "=== DONE ==="
