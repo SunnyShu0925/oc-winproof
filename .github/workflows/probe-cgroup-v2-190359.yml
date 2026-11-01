@@ -1,11 +1,9 @@
-name: Probe cgroup delegation v2 (PR 190359)
+name: Probe io controller delegation (PR 190359)
 
-# Validate the full delegation chain needed by resolveGatewayServiceCgroupDirectory():
-# - systemd 254+ cgroup v2 runner
-# - enable linger + io controller on user manager
-# - systemd-run --user transient unit with Delegate=yes/DelegateSubgroup=gateway
-# - process lands in <service>/gateway leaf (matches /0::...\.service\/gateway$/)
-# - io/cpu/memory controllers delegated to the service subtree
+# The agent-exec cgroup requires cpu+io+memory controllers delegated to the
+# service subtree. GHA's user manager defaults to cpu+memory+pids. This probe
+# walks up the cgroup hierarchy to find where io can be enabled and whether a
+# delegated transient service can see all three controllers.
 on:
   workflow_dispatch:
 
@@ -14,35 +12,47 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Probe full cgroup delegation chain
+      - name: Walk cgroup hierarchy for io controller
         run: |
           set -x
           sudo loginctl enable-linger "$USER"
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          # Enable io (and re-confirm cpu/memory) on the user manager subtree
-          # so a delegated child service can see all three controllers.
+          # Walk up: user service -> user-UID.slice -> user.slice -> system.slice? -> root
+          for cg in \
+            "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service" \
+            "/sys/fs/cgroup/user.slice/user-$(id -u).slice" \
+            "/sys/fs/cgroup/user.slice" \
+            "/sys/fs/cgroup"; do
+            echo "=== $cg ==="
+            echo "controllers: $(cat $cg/cgroup.controllers 2>&1)"
+            echo "subtree_control: $(cat $cg/cgroup.subtree_control 2>&1)"
+            echo "writable subtree_control? $(test -w $cg/cgroup.subtree_control && echo YES || echo NO)"
+          done
+          # Try enabling io at each writable level, deepest first.
+          echo "=== try enabling +io up the tree ==="
+          for cg in \
+            "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service" \
+            "/sys/fs/cgroup/user.slice/user-$(id -u).slice" \
+            "/sys/fs/cgroup/user.slice"; do
+            echo "try +io +cpu +memory at $cg"
+            echo "+io +cpu +memory" > "$cg/cgroup.subtree_control" 2>&1 || echo "(failed)"
+            echo "now: $(cat $cg/cgroup.subtree_control 2>&1)"
+          done
+          # Re-check user service controllers after enabling up the tree.
           USERSVC="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
-          echo "user service controllers before: $(cat $USERSVC/cgroup.controllers)"
-          sudo bash -c "echo '+io +cpu +memory' > '$USERSVC/cgroup.subtree_control'" 2>&1 || \
-            bash -c "echo '+io +cpu +memory' > '$USERSVC/cgroup.subtree_control'" 2>&1 || true
-          echo "user service subtree_control: $(cat $USERSVC/cgroup.subtree_control 2>&1)"
-          # Run a probe inside a delegated transient unit.
-          cat > /tmp/probe-in-unit.sh <<'PROBE'
-          set -x
-          echo "self cgroup: $(cat /proc/self/cgroup)"
-          SVCROOT="$(dirname $(dirname /sys/fs/cgroup$(cat /proc/self/cgroup | cut -c3-)))"
-          echo "SVCROOT=$SVCROOT"
-          ls -la "$SVCROOT" 2>&1 | head -25
-          echo "svc root controllers: $(cat $SVCROOT/cgroup.controllers)"
-          echo "svc root subtree_control: $(cat $SVCROOT/cgroup.subtree_control 2>&1)"
-          echo "gateway leaf procs: $(cat $SVCROOT/gateway/cgroup.procs 2>&1)"
-          echo "can write gateway/cgroup.procs? $(test -w $SVCROOT/gateway/cgroup.procs && echo YES || echo NO)"
-          echo "can write svc root subtree_control? $(test -w $SVCROOT/cgroup.subtree_control && echo YES || echo NO)"
-          PROBE
-          chmod +x /tmp/probe-in-unit.sh
-          systemd-run --user --unit=probe-delegate2 --property=Delegate=yes --property=DelegateSubgroup=gateway /tmp/probe-in-unit.sh 2>&1
+          echo "user service controllers after: $(cat $USERSVC/cgroup.controllers)"
+          # Now try a delegated unit and check its service root controllers.
+          cat > /tmp/p.sh <<'P'
+          echo "IN-UNIT self cgroup: $(cat /proc/self/cgroup)"
+          R="$(python3 -c "import os;print(os.path.dirname(os.path.dirname('/sys/fs/cgroup'+open('/proc/self/cgroup').read().split(':')[2].strip())))")"
+          echo "IN-UNIT svc root: $R"
+          echo "IN-UNIT svc root controllers: $(cat $R/cgroup.controllers)"
+          echo "IN-UNIT svc root subtree_control: $(cat $R/cgroup.subtree_control 2>&1)"
+          echo "IN-UNIT gateway leaf: $(ls -la $R/gateway 2>&1 | head -5)"
+          echo "IN-UNIT self cgroup matches gateway? $(grep -q 'gateway$' /proc/self/cgroup && echo YES || echo NO)"
+          P
+          systemd-run --user --unit=probe-io --property=Delegate=yes --property=DelegateSubgroup=gateway bash /tmp/p.sh 2>&1
           sleep 3
-          systemctl --user status probe-delegate2 --no-pager 2>&1 | head -15 || true
-          journalctl --user -u probe-delegate2 --no-pager -n 40 2>&1 || true
-          systemctl --user stop probe-delegate2 2>&1 || true
+          journalctl --user -u probe-io --no-pager -n 30 2>&1 || true
+          systemctl --user stop probe-io 2>&1 || true
           echo "=== DONE ==="
