@@ -27,6 +27,7 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -34,86 +35,13 @@ const STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/tmp/oc-proof-state";
 const PROOF_LOG = process.env.PROOF_LOG || "";
 const HOME = process.env.HOME || "/tmp/oc-proof-home";
 const CAPTURE_OBS_PATH = "/tmp/proof-capture-obs.txt";
-const SAMPLER_SCRIPT = "/tmp/proof-cgroup-sampler.mjs";
+const SAMPLER_SCRIPT =
+  process.env.PROOF_SAMPLER ||
+  fileURLToPath(new URL("./proof-cgroup-sampler.mjs", import.meta.url));
 const SAMPLER_READY = "/tmp/proof-sampler-ready";
 const SAMPLER_STOP = "/tmp/proof-sampler-stop";
 const SAMPLER_OUT = "/tmp/proof-sampler.jsonl";
 
-const SAMPLER_SOURCE = `
-import fs from "node:fs";
-const out = process.env.SAMPLER_OUT;
-const ready = process.env.SAMPLER_READY;
-const stop = process.env.SAMPLER_STOP;
-// Any shell the snapshot path spawns mentions one of these:
-//   shell-snapshots  -> validation (.tmp) and exec (.sh) shells
-//   snapshot.out     -> the interactive capture shell
-//   PROOF_CONTROL    -> the Gateway-internal control
-const MATCH = /shell-snapshots\/|snapshot\.out|PROOF_CONTROL/;
-fs.writeFileSync(out, "");
-fs.writeFileSync(ready, "1");
-const seen = new Set();
-const pending = new Map();
-const started = Date.now();
-const deadline = started + 180000;
-let passes = 0;
-let recorded = 0;
-while (Date.now() < deadline) {
-  passes += 1;
-  if ((passes & 31) === 0 && fs.existsSync(stop)) break;
-  let names = [];
-  try {
-    names = fs.readdirSync("/proc");
-  } catch {
-    continue;
-  }
-  for (const name of names) {
-    const pid = Number(name);
-    if (!pid || seen.has(pid)) continue;
-    let cmd = "";
-    try {
-      cmd = fs
-        .readFileSync("/proc/" + pid + "/cmdline", "utf8")
-        .replace(/\0+$/, "")
-        .split("\0")
-        .join(" ")
-        .replace(/\r?\n/g, "\\n")
-        .trim();
-    } catch {
-      continue;
-    }
-    // A just-forked child can still have an empty cmdline; leaving it unsettled
-    // means the next pass reads it again instead of dropping the pid forever.
-    // Kernel threads never get a cmdline, so they age out after MAX_MISSES.
-    if (!cmd) {
-      const misses = (pending.get(pid) || 0) + 1;
-      if (misses < 50) {
-        pending.set(pid, misses);
-        continue;
-      }
-    }
-    pending.delete(pid);
-    seen.add(pid);
-    if (!cmd || !MATCH.test(cmd)) continue;
-    let cg = null;
-    try {
-      const match = fs.readFileSync("/proc/" + pid + "/cgroup", "utf8").match(/^0::(.+)$/m);
-      cg = match ? match[1].trim() : null;
-    } catch {
-      cg = null;
-    }
-    fs.appendFileSync(
-      out,
-      JSON.stringify({ pid, cg, cmd: cmd.slice(0, 400), atMs: Date.now() - started }) + "\n",
-    );
-    recorded += 1;
-  }
-}
-fs.writeFileSync(
-  out + ".stats",
-  JSON.stringify({ passes, scanned: seen.size, recorded, elapsedMs: Date.now() - started }),
-);
-fs.writeFileSync(stop + ".done", "1");
-`;
 
 const lines = [];
 function log(message) {
@@ -279,9 +207,11 @@ async function main() {
   // shell is found wherever it actually ran, not only in cgroups we guessed.
   let sampler = null;
   if (agentExecDir) {
-    fs.writeFileSync(SAMPLER_SCRIPT, SAMPLER_SOURCE);
+    log(`PROOF sampler script: ${SAMPLER_SCRIPT} (exists: ${fs.existsSync(SAMPLER_SCRIPT)})`);
+    fs.rmSync("/tmp/proof-sampler.err", { force: true });
+    const samplerErrFd = fs.openSync("/tmp/proof-sampler.err", "a");
     sampler = nodeSpawn(process.execPath, [SAMPLER_SCRIPT], {
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", samplerErrFd],
       detached: false,
       env: {
         ...process.env,
@@ -290,11 +220,21 @@ async function main() {
         SAMPLER_STOP,
       },
     });
+    log(`PROOF sampler pid=${sampler.pid ?? "(none)"}`);
     const waitUntil = Date.now() + 15_000;
     while (!fs.existsSync(SAMPLER_READY) && Date.now() < waitUntil) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     log(`PROOF sampler ready: ${fs.existsSync(SAMPLER_READY)}`);
+    log(
+      `PROOF sampler stderr: ${(() => {
+        try {
+          return fs.readFileSync("/tmp/proof-sampler.err", "utf8").trim().slice(0, 400) || "(empty)";
+        } catch {
+          return "(none)";
+        }
+      })()}`,
+    );
   }
 
   let broker = null;

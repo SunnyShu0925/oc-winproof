@@ -34,6 +34,7 @@ jobs:
         run: |
           mkdir -p openclaw/proofs/190359
           cp oc-winproof/proofs/190359/proof-snapshot-cgroup.mjs openclaw/proofs/190359/
+          cp oc-winproof/proofs/190359/proof-cgroup-sampler.mjs openclaw/proofs/190359/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
