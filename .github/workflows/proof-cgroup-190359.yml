@@ -88,7 +88,11 @@ jobs:
           sleep 0.3
           BASHRC
           cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
-          { "gateway": { "mode": "local" }, "tools": { "exec": { "mode": "full", "host": "gateway" } } }
+          {
+            "gateway": { "mode": "local", "tools": { "allow": ["exec"] } },
+            "agents": { "entries": { "main": { "tools": { "allow": ["exec"] } } } },
+            "tools": { "exec": { "mode": "full", "host": "gateway" } }
+          }
           CFG
           systemd-run --user --unit=oc-proof-gw \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
