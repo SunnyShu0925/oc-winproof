@@ -95,7 +95,7 @@ async function waitReady(deadlineMs) {
 /** The shipped CLI is the only thing we drive; it speaks the Gateway RPC. */
 function callExec(round, workdir) {
   const params = {
-    tool: "exec",
+    name: "exec",
     args: {
       // The marker function exists only in ~/.bashrc, so printing it proves the
       // published snapshot was sourced by this exec shell.
@@ -220,9 +220,11 @@ async function main() {
   const kinds = { capture: [], validation: [], exec: [], other: [] };
   for (const record of records) {
     const cmd = record.cmd ?? "";
-    if (cmd.includes("PROOF_EXEC_")) {
+    // The CLI process carries the same JSON on its own command line, so an exec
+    // shell is only the process that also sources the published snapshot.
+    if (cmd.includes("PROOF_EXEC_") && cmd.includes("shell-snapshots/")) {
       kinds.exec.push(record);
-    } else if (cmd.includes(".tmp")) {
+    } else if (cmd.includes(".tmp") && cmd.includes("shell-snapshots/")) {
       kinds.validation.push(record);
     } else if (cmd.includes("snapshot.out")) {
       kinds.capture.push(record);
