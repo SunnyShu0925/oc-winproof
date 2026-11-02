@@ -163,25 +163,32 @@ async function main() {
   // Only the validation shell needs sampling: one small file read per iteration
   // keeps the sampling interval well below its 1-3ms lifetime.
   const samples = new Map();
+  const sampleDirs = [agentExecDir, agentExecDir ? path.join(path.dirname(agentExecDir), "gateway") : null]
+    .filter(Boolean);
   let sampling = Boolean(agentExecDir);
+  let sampleIterations = 0;
+  const sampleStartedAt = Date.now();
   const samplingDone = (async () => {
     while (sampling) {
-      let raw = "";
-      try {
-        raw = fs.readFileSync(path.join(agentExecDir, "cgroup.procs"), "utf8");
-      } catch {
-        raw = "";
-      }
-      for (const line of raw.split("\n")) {
-        const pid = Number(line.trim());
-        if (!pid || samples.has(pid)) continue;
-        let cmd = "";
+      sampleIterations += 1;
+      for (const dir of sampleDirs) {
+        let raw = "";
         try {
-          cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0+/g, " ").trim();
+          raw = fs.readFileSync(path.join(dir, "cgroup.procs"), "utf8");
         } catch {
-          cmd = "";
+          raw = "";
         }
-        samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid), hits: 1 });
+        for (const line of raw.split("\n")) {
+          const pid = Number(line.trim());
+          if (!pid || samples.has(pid)) continue;
+          let cmd = "";
+          try {
+            cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0+/g, " ").trim();
+          } catch {
+            cmd = "";
+          }
+          samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid), hits: 1 });
+        }
       }
       for (const entry of samples.values()) {
         entry.hits += 1;
@@ -268,6 +275,9 @@ async function main() {
 
   sampling = false;
   await samplingDone;
+  log(
+    `PROOF sampler iterations=${sampleIterations} elapsedMs=${Date.now() - sampleStartedAt} intervalUs=${Math.round(((Date.now() - sampleStartedAt) * 1000) / Math.max(1, sampleIterations))}`,
+  );
   try {
     await broker?.close?.();
   } catch {
@@ -293,7 +303,12 @@ async function main() {
       `PROOF observed validation pid=${sample.pid} cgroup=${sample.cgroup ?? "(unreadable)"} samples=${sample.hits} cmd=${sample.cmd}`,
     );
   }
-  log(`PROOF sampled agent-exec pids: ${samples.size}`);
+  log(`PROOF sampled pids: ${samples.size}`);
+  for (const entry of [...samples.values()].sort((a, b) => b.hits - a.hits).slice(0, 40)) {
+    log(
+      `PROOF sample pid=${entry.pid} hits=${entry.hits} cgroup=${entry.cgroup ?? "(gone)"} cmd=${entry.cmd.slice(0, 90)}`,
+    );
+  }
 
   const execPlacements = execCgroupPaths.map((file, index) => ({
     index: index + 1,
