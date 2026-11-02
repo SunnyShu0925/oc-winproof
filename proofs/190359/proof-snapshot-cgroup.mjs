@@ -41,60 +41,77 @@ const SAMPLER_OUT = "/tmp/proof-sampler.jsonl";
 
 const SAMPLER_SOURCE = `
 import fs from "node:fs";
-const dirs = process.env.SAMPLER_DIRS.split(",").filter(Boolean);
 const out = process.env.SAMPLER_OUT;
 const ready = process.env.SAMPLER_READY;
 const stop = process.env.SAMPLER_STOP;
+// Any shell the snapshot path spawns mentions one of these:
+//   shell-snapshots  -> validation (.tmp) and exec (.sh) shells
+//   snapshot.out     -> the interactive capture shell
+//   PROOF_CONTROL    -> the Gateway-internal control
+const MATCH = /shell-snapshots\/|snapshot\.out|PROOF_CONTROL/;
 fs.writeFileSync(out, "");
 fs.writeFileSync(ready, "1");
 const seen = new Set();
-const deadline = Date.now() + 180000;
+const pending = new Map();
+const started = Date.now();
+const deadline = started + 180000;
 let passes = 0;
 let recorded = 0;
-const started = Date.now();
 while (Date.now() < deadline) {
   passes += 1;
   if ((passes & 31) === 0 && fs.existsSync(stop)) break;
-  for (const dir of dirs) {
-    let raw = "";
+  let names = [];
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    continue;
+  }
+  for (const name of names) {
+    const pid = Number(name);
+    if (!pid || seen.has(pid)) continue;
+    let cmd = "";
     try {
-      raw = fs.readFileSync(dir + "/cgroup.procs", "utf8");
+      cmd = fs
+        .readFileSync("/proc/" + pid + "/cmdline", "utf8")
+        .replace(/\0+$/, "")
+        .split("\0")
+        .join(" ")
+        .replace(/\r?\n/g, "\\n")
+        .trim();
     } catch {
       continue;
     }
-    let index = 0;
-    while (index < raw.length) {
-      let end = raw.indexOf("\\n", index);
-      if (end === -1) end = raw.length;
-      const pid = Number(raw.slice(index, end));
-      index = end + 1;
-      if (!pid || seen.has(pid)) continue;
-      seen.add(pid);
-      let cmd = "";
-      try {
-        cmd = fs
-          .readFileSync("/proc/" + pid + "/cmdline", "utf8")
-          .replace(/\\0+$/, "")
-          .split("\\0")
-          .join(" ")
-          .replace(/\\r?\\n/g, "\\\\n")
-          .trim();
-      } catch {
-        cmd = "";
+    // A just-forked child can still have an empty cmdline; leaving it unsettled
+    // means the next pass reads it again instead of dropping the pid forever.
+    // Kernel threads never get a cmdline, so they age out after MAX_MISSES.
+    if (!cmd) {
+      const misses = (pending.get(pid) || 0) + 1;
+      if (misses < 50) {
+        pending.set(pid, misses);
+        continue;
       }
-      let cg = null;
-      try {
-        const match = fs.readFileSync("/proc/" + pid + "/cgroup", "utf8").match(/^0::(.+)$/m);
-        cg = match ? match[1].trim() : null;
-      } catch {
-        cg = null;
-      }
-      fs.appendFileSync(out, JSON.stringify({ pid, cg, cmd: cmd.slice(0, 400) }) + "\\n");
-      recorded += 1;
     }
+    pending.delete(pid);
+    seen.add(pid);
+    if (!cmd || !MATCH.test(cmd)) continue;
+    let cg = null;
+    try {
+      const match = fs.readFileSync("/proc/" + pid + "/cgroup", "utf8").match(/^0::(.+)$/m);
+      cg = match ? match[1].trim() : null;
+    } catch {
+      cg = null;
+    }
+    fs.appendFileSync(
+      out,
+      JSON.stringify({ pid, cg, cmd: cmd.slice(0, 400), atMs: Date.now() - started }) + "\n",
+    );
+    recorded += 1;
   }
 }
-fs.writeFileSync(out + ".stats", JSON.stringify({ passes, recorded, elapsedMs: Date.now() - started }));
+fs.writeFileSync(
+  out + ".stats",
+  JSON.stringify({ passes, scanned: seen.size, recorded, elapsedMs: Date.now() - started }),
+);
 fs.writeFileSync(stop + ".done", "1");
 `;
 
@@ -258,17 +275,16 @@ async function main() {
   // The sampler is the only observer for the validation shell, which cannot
   // report itself. It runs as its own process in the Gateway cgroup with a tight
   // synchronous loop so the main flow cannot starve it.
+  // The sampler is an independent observer: it scans /proc so the validation
+  // shell is found wherever it actually ran, not only in cgroups we guessed.
   let sampler = null;
-  if (serviceRoot) {
+  if (agentExecDir) {
     fs.writeFileSync(SAMPLER_SCRIPT, SAMPLER_SOURCE);
-    // Plain child_process: the instrument must not travel through the path it
-    // measures, and inheriting this process's cgroup keeps it in gateway.
     sampler = nodeSpawn(process.execPath, [SAMPLER_SCRIPT], {
       stdio: "ignore",
       detached: false,
       env: {
         ...process.env,
-        SAMPLER_DIRS: [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot].join(","),
         SAMPLER_OUT,
         SAMPLER_READY,
         SAMPLER_STOP,
@@ -333,7 +349,7 @@ async function main() {
     fs.rmSync(controlCgroupPath, { force: true });
     const control = spawnProcess(
       "/bin/bash",
-      ["-c", `${SELF_CGROUP_CMD} > ${controlCgroupPath}; sleep 0.2`],
+      ["-c", `# PROOF_CONTROL\n${SELF_CGROUP_CMD} > ${controlCgroupPath}; sleep 0.2`],
       { stdio: "ignore", env: { ...process.env } },
       undefined,
       "gateway-internal",
@@ -383,17 +399,27 @@ async function main() {
     log(`PROOF capture pid=${note.pid} cgroup=${shortCgroup(note.cgroup)} cmd=${note.cmd}`);
   }
 
+  try {
+    log(`PROOF sampler stats: ${fs.readFileSync(`${SAMPLER_OUT}.stats`, "utf8")}`);
+  } catch {
+    // sampler never finished
+  }
   const rows = readSamplerRows();
   const validationRows = rows.filter((row) =>
     /shell-snapshots\/[0-9a-f]+\.\d+\.\d+\.tmp/.test(row.cmd),
   );
+  const execRows = rows.filter((row) => /shell-snapshots\/[0-9a-f]+\.sh/.test(row.cmd));
+  const controlRows = rows.filter((row) => /PROOF_CONTROL/.test(row.cmd));
   for (const row of validationRows) {
     log(`PROOF validation pid=${row.pid} cgroup=${shortCgroup(row.cg)} cmd=${row.cmd}`);
   }
-  log(`PROOF sampled pids: ${rows.length}`);
-  for (const row of rows) {
-    log(`PROOF sample pid=${row.pid} cgroup=${shortCgroup(row.cg)} cmd=${row.cmd.slice(0, 200)}`);
+  for (const row of execRows) {
+    log(`PROOF exec-scan pid=${row.pid} cgroup=${shortCgroup(row.cg)} cmd=${row.cmd.slice(0, 160)}`);
   }
+  for (const row of controlRows) {
+    log(`PROOF control-scan pid=${row.pid} cgroup=${shortCgroup(row.cg)}`);
+  }
+  log(`PROOF scanned matches: ${rows.length}`);
 
   const execPlacements = execCgroupPaths.map((file, index) => ({
     index: index + 1,
@@ -449,6 +475,8 @@ async function main() {
     ["capture shell reported agent-exec", captureNotes.some((e) => isAgentExecLeaf(e.cgroup))],
     ["validation shell observed in agent-exec", validationRows.some((e) => isAgentExecLeaf(e.cg))],
     ["exec shell reported agent-exec", execPlacements.some((e) => isAgentExecLeaf(e.cgroup))],
+    ["exec shell observed in agent-exec", execRows.some((e) => isAgentExecLeaf(e.cg))],
+    ["validation shell never seen in gateway", !validationRows.some((e) => isGatewayLeaf(e.cg))],
     ["snapshot published with marker function", snapshotWithMarker],
     ["wrapped command sources snapshot", wrappedUsesSnapshot],
     [
@@ -457,6 +485,7 @@ async function main() {
     ],
     ["exec rounds exited 0", roundExitCodes.length > 0 && roundExitCodes.every((c) => c === 0)],
     ["gateway-internal control reported gateway", isGatewayLeaf(controlCgroup)],
+    ["gateway-internal control observed in gateway", controlRows.some((e) => isGatewayLeaf(e.cg))],
     ["self remained in gateway after", isGatewayLeaf(selfAfter)],
   ];
   for (const [name, ok] of checks) {
