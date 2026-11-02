@@ -5,20 +5,20 @@
 // owner (spawnProcess with executionIntent "agent-tool") inside a delegated
 // systemd unit, then checks which cgroup each shell actually landed in.
 //
-// Placement is reported by the shells themselves wherever possible, because the
-// exec and validation shells live only 1-3ms:
+// Placement comes from the shells themselves where they can report it:
 //   * ~/.bashrc runs inside the interactive capture shell and records its own
-//     /proc/self/cgroup.
+//     /proc/self/cgroup plus its cmdline.
 //   * the exec command and the Gateway-internal control record their own
 //     /proc/<pid>/cgroup from inside the spawned shell.
-//   * only the snapshot validation shell cannot report itself (its environment is
-//     the filtered capture env and it exits immediately), so a tight polling loop
-//     reads the agent-exec leaf and samples its cmdline.
+//   * the snapshot validation shell sources a file it cannot instrument and
+//     exits in a few milliseconds, so a dedicated sampler process reads every
+//     cgroup member in a tight synchronous loop and records each new pid with
+//     its cgroup and cmdline.
 //
 // Checks:
 //   1. Gateway leaf membership before and after the run
 //   2. capture shell reported agent-exec
-//   3. validation shell reported agent-exec
+//   3. validation shell observed in agent-exec
 //   4. exec shell reported agent-exec
 //   5. the snapshot was captured and published with the marker function
 //   6. the exec shell actually sourced it (marker defined only in ~/.bashrc)
@@ -33,6 +33,69 @@ const STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/tmp/oc-proof-state";
 const PROOF_LOG = process.env.PROOF_LOG || "";
 const HOME = process.env.HOME || "/tmp/oc-proof-home";
 const CAPTURE_OBS_PATH = "/tmp/proof-capture-obs.txt";
+const SAMPLER_SCRIPT = "/tmp/proof-cgroup-sampler.mjs";
+const SAMPLER_READY = "/tmp/proof-sampler-ready";
+const SAMPLER_STOP = "/tmp/proof-sampler-stop";
+const SAMPLER_OUT = "/tmp/proof-sampler.jsonl";
+
+const SAMPLER_SOURCE = `
+import fs from "node:fs";
+const dirs = process.env.SAMPLER_DIRS.split(",").filter(Boolean);
+const out = process.env.SAMPLER_OUT;
+const ready = process.env.SAMPLER_READY;
+const stop = process.env.SAMPLER_STOP;
+fs.writeFileSync(out, "");
+fs.writeFileSync(ready, "1");
+const seen = new Set();
+const deadline = Date.now() + 180000;
+let passes = 0;
+let recorded = 0;
+const started = Date.now();
+while (Date.now() < deadline) {
+  passes += 1;
+  if ((passes & 31) === 0 && fs.existsSync(stop)) break;
+  for (const dir of dirs) {
+    let raw = "";
+    try {
+      raw = fs.readFileSync(dir + "/cgroup.procs", "utf8");
+    } catch {
+      continue;
+    }
+    let index = 0;
+    while (index < raw.length) {
+      let end = raw.indexOf("\\n", index);
+      if (end === -1) end = raw.length;
+      const pid = Number(raw.slice(index, end));
+      index = end + 1;
+      if (!pid || seen.has(pid)) continue;
+      seen.add(pid);
+      let cmd = "";
+      try {
+        cmd = fs
+          .readFileSync("/proc/" + pid + "/cmdline", "utf8")
+          .replace(/\\0+$/, "")
+          .split("\\0")
+          .join(" ")
+          .replace(/\\r?\\n/g, "\\\\n")
+          .trim();
+      } catch {
+        cmd = "";
+      }
+      let cg = null;
+      try {
+        const match = fs.readFileSync("/proc/" + pid + "/cgroup", "utf8").match(/^0::(.+)$/m);
+        cg = match ? match[1].trim() : null;
+      } catch {
+        cg = null;
+      }
+      fs.appendFileSync(out, JSON.stringify({ pid, cg, cmd: cmd.slice(0, 400) }) + "\\n");
+      recorded += 1;
+    }
+  }
+}
+fs.writeFileSync(out + ".stats", JSON.stringify({ passes, recorded, elapsedMs: Date.now() - started }));
+fs.writeFileSync(stop + ".done", "1");
+`;
 
 const lines = [];
 function log(message) {
@@ -59,29 +122,6 @@ function readKernelCgroup(pid) {
     return null;
   }
 }
-function readCmdline(pid) {
-  try {
-    return fs
-      .readFileSync(`/proc/${pid}/cmdline`, "utf8")
-      .replace(/\0+$/, "")
-      .split("\0")
-      .join(" ")
-      .replace(/\r?\n/g, "\\n")
-      .trim();
-  } catch {
-    return "";
-  }
-}
-
-function readParentPid(pid) {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const close = stat.lastIndexOf(")");
-    return Number(stat.slice(close + 2).split(" ")[1]) || null;
-  } catch {
-    return null;
-  }
-}
 
 function shortCgroup(cg) {
   if (!cg) return "(gone)";
@@ -93,14 +133,14 @@ function shortCgroup(cg) {
 const isGatewayLeaf = (cg) => Boolean(cg && /\/gateway$/.test(cg));
 const isAgentExecLeaf = (cg) => Boolean(cg && /\/agent-exec$/.test(cg));
 
-// `sed -n s/^0:://p` returns the v2 leaf from /proc/<pid>/cgroup without quoting
-// problems inside the single-quoted eval the snapshot wrapper builds.
+// `sed -n s/^0:://p` prints only the cgroup v2 line, and needs no quoting inside
+// the single-quoted eval that the snapshot wrapper builds.
 const SELF_CGROUP_CMD = "sed -n s/^0:://p /proc/$$/cgroup";
 
 // Runs inside the interactive capture shell; records the shell's own placement.
 const CAPTURE_NOTE = [
   "__proof_note() {",
-  `  printf '%s|%s|%s|%s\\n' "$$" "$(sed -n s/^0:://p /proc/$$/cgroup)" "$(tr '\\0\\n' '  ' < /proc/$$/cmdline | cut -c1-300)" "capture" >> ${CAPTURE_OBS_PATH}`,
+  `  printf '%s|%s|%s\\n' "$$" "$(sed -n s/^0:://p /proc/$$/cgroup)" "$(tr '\\0\\n' '  ' < /proc/$$/cmdline | cut -c1-300)" >> ${CAPTURE_OBS_PATH}`,
   "}",
   "__proof_note",
 ].join("\n");
@@ -116,8 +156,8 @@ function readCaptureObservations() {
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     const parts = line.split("|");
-    if (parts.length < 4) continue;
-    entries.push({ pid: Number(parts[0]), cgroup: parts[1] || null, cmd: parts[2], kind: parts[3] });
+    if (parts.length < 3) continue;
+    entries.push({ pid: Number(parts[0]), cgroup: parts[1] || null, cmd: parts.slice(2).join("|") });
   }
   return entries;
 }
@@ -131,6 +171,25 @@ function readSelfCgroupFile(file) {
   }
 }
 
+function readSamplerRows() {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(SAMPLER_OUT, "utf8");
+  } catch {
+    return [];
+  }
+  const rows = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {
+      // ignore a partially written final line
+    }
+  }
+  return rows;
+}
+
 async function main() {
   process.env.SHELL = "/bin/bash";
   process.env.OPENCLAW_STATE_DIR = STATE_DIR;
@@ -138,12 +197,15 @@ async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
   fs.rmSync(CAPTURE_OBS_PATH, { force: true });
+  fs.rmSync(SAMPLER_READY, { force: true });
+  fs.rmSync(SAMPLER_STOP, { force: true });
+  fs.rmSync(`${SAMPLER_STOP}.done`, { force: true });
 
   // Only an interactive capture shell reads this. The marker function exists
   // nowhere else, so printing it proves the published snapshot was sourced.
   // The alias block is a realistic heavy startup file: it makes the snapshot big
-  // enough that the validation shell lives long enough to be observed, and
-  // placement does not depend on snapshot size.
+  // enough that the short-lived validation shell stays observable. Placement does
+  // not depend on snapshot size.
   const ALIAS_COUNT = 3000;
   const aliasLines = Array.from(
     { length: ALIAS_COUNT },
@@ -181,7 +243,37 @@ async function main() {
   log(`PROOF initializeGatewayExecCgroup: ${initMessage}`);
   const agentExecDir = cgroupMod.getAgentExecCgroup();
   log(`PROOF getAgentExecCgroup: ${agentExecDir ?? "(undefined)"}`);
-  log(`PROOF service cgroup root: ${agentExecDir ? path.dirname(agentExecDir) : "(none)"}`);
+  const serviceRoot = agentExecDir ? path.dirname(agentExecDir) : null;
+  log(`PROOF service cgroup root: ${serviceRoot ?? "(none)"}`);
+
+  // The sampler is the only observer for the validation shell, which cannot
+  // report itself. It runs as its own process in the Gateway cgroup with a tight
+  // synchronous loop so the main flow cannot starve it.
+  let sampler = null;
+  if (serviceRoot) {
+    fs.writeFileSync(SAMPLER_SCRIPT, SAMPLER_SOURCE);
+    sampler = spawnProcess(
+      process.execPath,
+      [SAMPLER_SCRIPT],
+      {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          SAMPLER_DIRS: [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot].join(","),
+          SAMPLER_OUT,
+          SAMPLER_READY,
+          SAMPLER_STOP,
+        },
+      },
+      undefined,
+      "gateway-internal",
+    );
+    const waitUntil = Date.now() + 15_000;
+    while (!fs.existsSync(SAMPLER_READY) && Date.now() < waitUntil) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    log(`PROOF sampler ready: ${fs.existsSync(SAMPLER_READY)}`);
+  }
 
   let broker = null;
   if (agentExecDir) {
@@ -190,52 +282,6 @@ async function main() {
       onStartupFailure: (message) => log(`PROOF broker startup failure: ${message}`),
     });
   }
-
-  // Only the validation shell needs sampling: one small file read per iteration
-  // keeps the sampling interval well below its 1-3ms lifetime.
-  const samples = new Map();
-  const serviceRoot = agentExecDir ? path.dirname(agentExecDir) : null;
-  const sampleDirs = agentExecDir
-    ? [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot]
-    : [];
-  let sampling = Boolean(agentExecDir);
-  let sampleIterations = 0;
-  const sampleStartedAt = Date.now();
-  const samplingDone = (async () => {
-    while (sampling) {
-      sampleIterations += 1;
-      const present = new Set();
-      for (const dir of sampleDirs) {
-        let raw = "";
-        try {
-          raw = fs.readFileSync(path.join(dir, "cgroup.procs"), "utf8");
-        } catch {
-          raw = "";
-        }
-        for (const line of raw.split("\n")) {
-          const pid = Number(line.trim());
-          if (!pid) continue;
-          present.add(pid);
-          if (samples.has(pid)) continue;
-          samples.set(pid, {
-            pid,
-            ppid: readParentPid(pid),
-            cmd: readCmdline(pid),
-            cgroup: readKernelCgroup(pid),
-            hits: 1,
-          });
-        }
-      }
-      for (const entry of samples.values()) {
-        if (present.has(entry.pid)) entry.hits += 1;
-        if (entry.cmd) continue;
-        // Late cmdline read for a pid first seen mid-spawn.
-        const cmd = readCmdline(entry.pid);
-        if (cmd) entry.cmd = cmd;
-      }
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  })();
 
   const markerPaths = [];
   const execCgroupPaths = [];
@@ -296,17 +342,18 @@ async function main() {
       await round();
     }
   } catch (error) {
-    sampling = false;
-    await samplingDone;
     log(`PROOF ERROR during run: ${error?.stack ?? error}`);
     finish(2);
   }
 
-  sampling = false;
-  await samplingDone;
-  log(
-    `PROOF sampler iterations=${sampleIterations} elapsedMs=${Date.now() - sampleStartedAt} intervalUs=${Math.round(((Date.now() - sampleStartedAt) * 1000) / Math.max(1, sampleIterations))}`,
-  );
+  if (sampler) {
+    fs.writeFileSync(SAMPLER_STOP, "1");
+    const waitUntil = Date.now() + 20_000;
+    while (!fs.existsSync(`${SAMPLER_STOP}.done`) && Date.now() < waitUntil) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await once(sampler, "close").catch(() => undefined);
+  }
   try {
     await broker?.close?.();
   } catch {
@@ -319,24 +366,19 @@ async function main() {
 
   const captureNotes = readCaptureObservations();
   for (const note of captureNotes) {
-    log(
-      `PROOF observed capture pid=${note.pid} cgroup=${note.cgroup ?? "(unreadable)"} cmd=${note.cmd}`,
-    );
+    log(`PROOF capture pid=${note.pid} cgroup=${shortCgroup(note.cgroup)} cmd=${note.cmd}`);
   }
 
-  const validationSamples = [...samples.values()].filter((entry) =>
-    /shell-snapshots\/[0-9a-f]+\.\d+\.\d+\.tmp/.test(entry.cmd),
+  const rows = readSamplerRows();
+  const validationRows = rows.filter((row) =>
+    /shell-snapshots\/[0-9a-f]+\.\d+\.\d+\.tmp/.test(row.cmd),
   );
-  for (const sample of validationSamples) {
-    log(
-      `PROOF observed validation pid=${sample.pid} cgroup=${sample.cgroup ?? "(unreadable)"} samples=${sample.hits} cmd=${sample.cmd}`,
-    );
+  for (const row of validationRows) {
+    log(`PROOF validation pid=${row.pid} cgroup=${shortCgroup(row.cg)} cmd=${row.cmd}`);
   }
-  log(`PROOF sampled pids: ${samples.size}`);
-  for (const entry of [...samples.values()].sort((a, b) => a.pid - b.pid)) {
-    log(
-      `PROOF sample pid=${entry.pid} ppid=${entry.ppid ?? "?"} hits=${entry.hits} cgroup=${shortCgroup(entry.cgroup)} cmd=${entry.cmd.slice(0, 260)}`,
-    );
+  log(`PROOF sampled pids: ${rows.length}`);
+  for (const row of rows) {
+    log(`PROOF sample pid=${row.pid} cgroup=${shortCgroup(row.cg)} cmd=${row.cmd.slice(0, 200)}`);
   }
 
   const execPlacements = execCgroupPaths.map((file, index) => ({
@@ -344,18 +386,14 @@ async function main() {
     cgroup: readSelfCgroupFile(file),
   }));
   for (const placement of execPlacements) {
-    log(
-      `PROOF observed exec round=${placement.index} cgroup=${placement.cgroup ?? "(no self-report)"}`,
-    );
+    log(`PROOF exec round=${placement.index} cgroup=${shortCgroup(placement.cgroup)}`);
   }
   const controlCgroup = readSelfCgroupFile(controlCgroupPath);
-  log(`PROOF observed gateway-control cgroup=${controlCgroup ?? "(no self-report)"}`);
+  log(`PROOF gateway-control cgroup=${shortCgroup(controlCgroup)}`);
 
   log(`PROOF capture shell pids: ${captureNotes.map((e) => e.pid).join(",") || "(none)"}`);
-  log(`PROOF validation shell pids: ${validationSamples.map((e) => e.pid).join(",") || "(none)"}`);
-  log(
-    `PROOF exec self-reports: ${execPlacements.filter((e) => e.cgroup).length}/${execPlacements.length}`,
-  );
+  log(`PROOF validation shell pids: ${validationRows.map((e) => e.pid).join(",") || "(none)"}`);
+  log(`PROOF exec self-reports: ${execPlacements.filter((e) => e.cgroup).length}/${execPlacements.length}`);
 
   const snapshotDir = path.join(STATE_DIR, "cache", "shell-snapshots");
   let snapshotFiles = [];
@@ -395,10 +433,7 @@ async function main() {
     ["self in gateway before", isGatewayLeaf(selfBefore)],
     ["agent-exec cgroup available", Boolean(agentExecDir)],
     ["capture shell reported agent-exec", captureNotes.some((e) => isAgentExecLeaf(e.cgroup))],
-    [
-      "validation shell reported agent-exec",
-      validationSamples.some((e) => isAgentExecLeaf(e.cgroup)),
-    ],
+    ["validation shell observed in agent-exec", validationRows.some((e) => isAgentExecLeaf(e.cg))],
     ["exec shell reported agent-exec", execPlacements.some((e) => isAgentExecLeaf(e.cgroup))],
     ["snapshot published with marker function", snapshotWithMarker],
     ["wrapped command sources snapshot", wrappedUsesSnapshot],
