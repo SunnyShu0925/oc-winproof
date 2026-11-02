@@ -90,12 +90,12 @@ jobs:
           BASHRC
           cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
           {
-            "gateway": { "mode": "local" },
+            "gateway": { "mode": "local", "port": 18787 },
             "models": {
               "mode": "merge",
               "providers": {
                 "openai": {
-                  "baseUrl": "http://127.0.0.1:18789/v1",
+                  "baseUrl": "http://127.0.0.1:18799/v1",
                   "api": "openai-completions",
                   "apiKey": "proof-stub-key",
                   "agentRuntime": { "id": "openclaw" },
@@ -146,7 +146,7 @@ jobs:
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler.ready" \
           SAMPLER_STOP="$RUNNER_TEMP/proof-sampler.stop" \
           PROOF_HTTP="http://127.0.0.1:18787" \
-          PROOF_MOCK_PORT="18789" \
+          PROOF_MOCK_PORT="18799" \
           PROOF_MOCK_CONTROL="/tmp/proof-mock-control.json" \
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
@@ -176,7 +176,7 @@ jobs:
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           cp "$RUNNER_TEMP/oc-gw-home/.bashrc" "$HOME/.bashrc"
-          sed 's/18789/18790/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
+          sed -e 's/18799/18798/' -e 's/18787/18788/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
           (cd openclaw && OPENCLAW_FORCE_BUILD=1 pnpm openclaw --version)
           systemd-run --user --unit=oc-proof-gw-pre \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
@@ -201,7 +201,7 @@ jobs:
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler-pre.ready" \
           SAMPLER_STOP="$RUNNER_TEMP/proof-sampler-pre.stop" \
           PROOF_HTTP="http://127.0.0.1:18788" \
-          PROOF_MOCK_PORT="18790" \
+          PROOF_MOCK_PORT="18798" \
           PROOF_MOCK_CONTROL="/tmp/proof-mock-control-pre.json" \
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
