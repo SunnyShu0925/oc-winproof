@@ -59,6 +59,37 @@ function readKernelCgroup(pid) {
     return null;
   }
 }
+function readCmdline(pid) {
+  try {
+    return fs
+      .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .replace(/\0+$/, "")
+      .split("\0")
+      .join(" ")
+      .replace(/\r?\n/g, "\\n")
+      .trim();
+  } catch {
+    return "";
+  }
+}
+
+function readParentPid(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    return Number(stat.slice(close + 2).split(" ")[1]) || null;
+  } catch {
+    return null;
+  }
+}
+
+function shortCgroup(cg) {
+  if (!cg) return "(gone)";
+  const marker = "app.slice/";
+  const at = cg.indexOf(marker);
+  return at === -1 ? cg : cg.slice(at + marker.length);
+}
+
 const isGatewayLeaf = (cg) => Boolean(cg && /\/gateway$/.test(cg));
 const isAgentExecLeaf = (cg) => Boolean(cg && /\/agent-exec$/.test(cg));
 
@@ -186,28 +217,21 @@ async function main() {
           if (!pid) continue;
           present.add(pid);
           if (samples.has(pid)) continue;
-          let cmd = "";
-          try {
-            cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0+/g, " ").trim();
-          } catch {
-            cmd = "";
-          }
-          samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid), hits: 1 });
+          samples.set(pid, {
+            pid,
+            ppid: readParentPid(pid),
+            cmd: readCmdline(pid),
+            cgroup: readKernelCgroup(pid),
+            hits: 1,
+          });
         }
       }
       for (const entry of samples.values()) {
         if (present.has(entry.pid)) entry.hits += 1;
         if (entry.cmd) continue;
         // Late cmdline read for a pid first seen mid-spawn.
-        try {
-          const cmd = fs
-            .readFileSync(`/proc/${entry.pid}/cmdline`, "utf8")
-            .replace(/\0+/g, " ")
-            .trim();
-          if (cmd) entry.cmd = cmd;
-        } catch {
-          // still gone
-        }
+        const cmd = readCmdline(entry.pid);
+        if (cmd) entry.cmd = cmd;
       }
       await new Promise((resolve) => setImmediate(resolve));
     }
@@ -311,7 +335,7 @@ async function main() {
   log(`PROOF sampled pids: ${samples.size}`);
   for (const entry of [...samples.values()].sort((a, b) => a.pid - b.pid)) {
     log(
-      `PROOF sample pid=${entry.pid} hits=${entry.hits} cgroup=${entry.cgroup ?? "(gone)"} cmd=${entry.cmd.slice(0, 90)}`,
+      `PROOF sample pid=${entry.pid} ppid=${entry.ppid ?? "?"} hits=${entry.hits} cgroup=${shortCgroup(entry.cgroup)} cmd=${entry.cmd.slice(0, 260)}`,
     );
   }
 
