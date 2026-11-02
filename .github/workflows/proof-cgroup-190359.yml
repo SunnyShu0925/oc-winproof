@@ -1,8 +1,8 @@
 name: Cgroup placement proof (PR 190359)
 
-# Real-behavior proof that shell snapshot capture/validation subprocesses land
-# in agent-exec (post-fix) vs the gateway cgroup (pre-fix), driven end to end
-# through a real `openclaw gateway run` process and the shipped CLI.
+# Real-behavior proof that shell snapshot capture/validation subprocesses land in
+# agent-exec (post-fix) vs the gateway cgroup (pre-fix), driven end to end through
+# an isolated Gateway and the shipped CLI agent turn.
 on:
   workflow_dispatch:
     inputs:
@@ -38,7 +38,7 @@ jobs:
       - name: Copy proof scripts into openclaw tree
         run: |
           mkdir -p openclaw/proofs/190359
-          cp oc-winproof/proofs/190359/proof-gateway-exec.mjs openclaw/proofs/190359/
+          cp oc-winproof/proofs/190359/proof-gateway-agent.mjs openclaw/proofs/190359/
           cp oc-winproof/proofs/190359/proof-cgroup-sampler.mjs openclaw/proofs/190359/
 
       - name: Setup Node.js
@@ -70,8 +70,8 @@ jobs:
           sudo bash -c "echo '+io +cpu +memory' > '$USERSVC/app.slice/cgroup.subtree_control'" 2>&1 || true
           echo "app.slice controllers: $(cat $USERSVC/app.slice/cgroup.subtree_control)"
 
-      - name: Run post-fix proof through a real Gateway (PR head)
-        timeout-minutes: 12
+      - name: Run post-fix proof through a real Gateway agent turn (PR head)
+        timeout-minutes: 14
         run: |
           set -x
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -79,18 +79,45 @@ jobs:
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state"
           export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config.json"
           export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
+          export OPENAI_API_KEY="proof-stub-key"
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           cat > "$HOME/.bashrc" <<'BASHRC'
           # Exists only in this file, so printing it proves a published snapshot was sourced.
-          proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED\n'; }
+          proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED'; }
           for i in $(seq 1 500); do alias proof_alias_$i='true'; done
           sleep 0.3
           BASHRC
           cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
           {
-            "gateway": { "mode": "local", "tools": { "allow": ["exec"] } },
-            "agents": { "entries": { "main": { "tools": { "allow": ["exec"] } } } },
+            "gateway": { "mode": "local" },
+            "models": {
+              "mode": "merge",
+              "providers": {
+                "openai": {
+                  "baseUrl": "http://127.0.0.1:18789/v1",
+                  "api": "openai-completions",
+                  "apiKey": "proof-stub-key",
+                  "agentRuntime": { "id": "openclaw" },
+                  "request": { "allowPrivateNetwork": true },
+                  "models": [
+                    {
+                      "id": "gpt-5.6-luna",
+                      "name": "gpt-5.6-luna",
+                      "api": "openai-completions",
+                      "agentRuntime": { "id": "openclaw" },
+                      "reasoning": false,
+                      "input": ["text"],
+                      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                      "contextWindow": 128000,
+                      "contextTokens": 96000,
+                      "maxTokens": 4096
+                    }
+                  ]
+                }
+              }
+            },
+            "agents": { "defaults": { "model": { "primary": "openai/gpt-5.6-luna" } } },
             "tools": { "exec": { "mode": "full", "host": "gateway" } }
           }
           CFG
@@ -101,6 +128,7 @@ jobs:
             --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
             --setenv=OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_PATH" \
             --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+            --setenv=OPENAI_API_KEY="$OPENAI_API_KEY" \
             --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
             bash -c 'pnpm openclaw gateway run --port 18787 --auth token > /tmp/oc-gw.log 2>&1'
           for i in $(seq 1 180); do
@@ -118,20 +146,20 @@ jobs:
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler.ready" \
           SAMPLER_STOP="$RUNNER_TEMP/proof-sampler.stop" \
           PROOF_HTTP="http://127.0.0.1:18787" \
-          PROOF_WS="ws://127.0.0.1:18787" \
-          PROOF_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+          PROOF_MOCK_PORT="18789" \
+          PROOF_MOCK_CONTROL="/tmp/proof-mock-control.json" \
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw" \
-          node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-exec.mjs" 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
+          node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
           echo "=== gateway log tail ==="
-          tail -60 /tmp/oc-gw.log || true
+          tail -40 /tmp/oc-gw.log || true
           systemctl --user stop oc-proof-gw || true
           grep -c "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log" || true
 
       - name: Run pre-fix control (main's shell-snapshot.ts)
         if: ${{ github.event.inputs.pre_fix == 'true' }}
-        timeout-minutes: 15
+        timeout-minutes: 18
         run: |
           set -x
           cd openclaw
@@ -144,10 +172,11 @@ jobs:
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state-pre"
           export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config-pre.json"
           export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
+          export OPENAI_API_KEY="proof-stub-key"
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           cp "$RUNNER_TEMP/oc-gw-home/.bashrc" "$HOME/.bashrc"
-          cp "$RUNNER_TEMP/oc-gw-config.json" "$OPENCLAW_CONFIG_PATH"
+          sed 's/18789/18790/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
           (cd openclaw && OPENCLAW_FORCE_BUILD=1 pnpm openclaw --version)
           systemd-run --user --unit=oc-proof-gw-pre \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
@@ -156,6 +185,7 @@ jobs:
             --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
             --setenv=OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_PATH" \
             --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+            --setenv=OPENAI_API_KEY="$OPENAI_API_KEY" \
             --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
             bash -c 'pnpm openclaw gateway run --port 18788 --auth token > /tmp/oc-gw-pre.log 2>&1'
           for i in $(seq 1 180); do
@@ -171,12 +201,12 @@ jobs:
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler-pre.ready" \
           SAMPLER_STOP="$RUNNER_TEMP/proof-sampler-pre.stop" \
           PROOF_HTTP="http://127.0.0.1:18788" \
-          PROOF_WS="ws://127.0.0.1:18788" \
-          PROOF_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+          PROOF_MOCK_PORT="18790" \
+          PROOF_MOCK_CONTROL="/tmp/proof-mock-control-pre.json" \
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw-pre" \
-          node openclaw/proofs/190359/proof-gateway-exec.mjs 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
+          node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
           tail -40 /tmp/oc-gw-pre.log || true
           systemctl --user stop oc-proof-gw-pre || true
 
@@ -190,3 +220,4 @@ jobs:
             ${{ runner.temp }}/prefix.log
             ${{ runner.temp }}/proof-sampler*.jsonl
             /tmp/oc-gw*.log
+            /tmp/proof-mock-requests*.jsonl

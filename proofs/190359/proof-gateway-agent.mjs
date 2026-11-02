@@ -1,0 +1,273 @@
+// Drives a real agent shell-tool turn through an isolated Gateway using the
+// repository's own e2e OpenAI-compatible mock provider, and records where the
+// snapshot capture/validation subprocesses actually ran.
+//
+// Flow per round: shipped CLI (`openclaw agent`) -> Gateway RPC -> session ->
+// agent loop -> `exec` tool -> host exec preparation -> spawn broker ->
+// shell snapshot capture + validation + exec shell.
+//
+// The only synthetic part is inference: scripts/e2e/mock-openai-server.mjs
+// returns a scripted exec tool call. Placement is decided by the exec tool and
+// the broker, never by the model, so a scripted provider cannot change the
+// observed cgroups.
+
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import process from "node:process";
+
+const REPO = process.env.PROOF_REPO ?? process.cwd();
+const HTTP = process.env.PROOF_HTTP ?? "http://127.0.0.1:18787";
+const UNIT = process.env.PROOF_UNIT ?? "";
+const STATE_DIR = process.env.PROOF_STATE_DIR ?? "";
+const MOCK_PORT = process.env.PROOF_MOCK_PORT ?? "18789";
+const CONTROL = process.env.PROOF_MOCK_CONTROL ?? "/tmp/proof-mock-control.json";
+const ROUNDS = 3;
+
+const checks = [];
+function check(name, ok, detail = "") {
+  checks.push({ name, ok });
+  console.log(`PROOF check ${ok ? "PASS" : "FAIL"}: ${name}${detail ? ` (${detail})` : ""}`);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function readCgroup(pid) {
+  try {
+    const line = fs
+      .readFileSync(`/proc/${pid}/cgroup`, "utf8")
+      .split("\n")
+      .find((entry) => entry.startsWith("0::"));
+    return line ? line.slice(3) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function short(cgroup) {
+  if (!cgroup) {
+    return "unknown";
+  }
+  return cgroup.split("/").filter(Boolean).slice(-3).join("/");
+}
+
+/** The Gateway node process: only one matching pid sits in the gateway leaf. */
+function gatewayPid() {
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/u.test(entry)) {
+      continue;
+    }
+    const cgroup = readCgroup(entry);
+    if (!cgroup || !short(cgroup).endsWith("gateway")) {
+      continue;
+    }
+    try {
+      const cmd = fs.readFileSync(`/proc/${entry}/cmdline`, "utf8").replace(/\0/gu, " ");
+      if (cmd.includes("gateway") && cmd.includes("node")) {
+        return Number(entry);
+      }
+    } catch {
+      // Process exited while scanning.
+    }
+  }
+  return undefined;
+}
+
+async function httpOk(url) {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(url, deadlineMs) {
+  const started = Date.now();
+  while (Date.now() - started < deadlineMs) {
+    if (await httpOk(url)) {
+      return true;
+    }
+    await sleep(1000);
+  }
+  return false;
+}
+
+function writeControl(round) {
+  fs.writeFileSync(
+    CONTROL,
+    JSON.stringify({
+      text: `round ${round} complete`,
+      toolCall: {
+        name: "exec",
+        args: {
+          // `proof_snapshot_marker` exists only in the interactive rc file, so a
+          // marker file proves this shell sourced the published snapshot.
+          command: `# PROOF_EXEC_${round}\nproof_snapshot_marker > /tmp/proof-round-${round}.out\n`,
+          workdir: `/tmp/proof-agent-wd-${round}`,
+          yieldMs: 30000,
+          timeoutSeconds: 60,
+        },
+      },
+    }),
+  );
+}
+
+function runAgentTurn(round) {
+  const started = Date.now();
+  const result = spawnSync(
+    "pnpm",
+    ["openclaw", "agent", "--agent", "main", "--message", `proof round ${round}`, "--json"],
+    { cwd: REPO, encoding: "utf8", timeout: 240000, env: process.env },
+  );
+  return { round, status: result.status, out: `${result.stdout ?? ""}${result.stderr ?? ""}`, ms: Date.now() - started };
+}
+
+function publishedSnapshots() {
+  try {
+    return fs.readdirSync(`${STATE_DIR}/cache/shell-snapshots`).filter((name) => name.endsWith(".sh"));
+  } catch {
+    return [];
+  }
+}
+
+async function main() {
+  console.log(`PROOF gateway ${HTTP} unit=${UNIT} repo=${REPO}`);
+
+  const mock = spawn(process.execPath, [`${REPO}/scripts/e2e/mock-openai-server.mjs`], {
+    cwd: REPO,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, MOCK_PORT, MOCK_RESPONSE_CONTROL: CONTROL, MOCK_REQUEST_LOG: "/tmp/proof-mock-requests.jsonl" },
+  });
+  let mockLog = "";
+  mock.stdout.on("data", (chunk) => {
+    mockLog += String(chunk);
+  });
+  mock.stderr.on("data", (chunk) => {
+    mockLog += String(chunk);
+  });
+  const mockReady = await waitFor(`http://127.0.0.1:${MOCK_PORT}/health`, 30_000);
+  check("e2e mock provider answered /health", mockReady, `port=${MOCK_PORT}`);
+
+  const ready = await waitFor(`${HTTP}/readyz`, 180_000);
+  const gwPid = gatewayPid();
+  const gwBefore = gwPid ? readCgroup(gwPid) : undefined;
+  console.log(`PROOF gateway pid=${gwPid} cgroup=${short(gwBefore)}`);
+  check("gateway answered /readyz", ready);
+  check("gateway process runs in the service gateway leaf", short(gwBefore).endsWith("gateway"), short(gwBefore));
+
+  const sampler = spawn(process.execPath, [`${REPO}/proofs/190359/proof-cgroup-sampler.mjs`], {
+    cwd: REPO,
+    stdio: ["ignore", "ignore", "inherit"],
+    env: process.env,
+  });
+  const readyDeadline = Date.now() + 30_000;
+  while (Date.now() < readyDeadline && !fs.existsSync(process.env.SAMPLER_READY ?? "")) {
+    await sleep(100);
+  }
+
+  const rounds = [];
+  for (let round = 1; round <= ROUNDS; round += 1) {
+    fs.mkdirSync(`/tmp/proof-agent-wd-${round}`, { recursive: true });
+    fs.rmSync(`/tmp/proof-round-${round}.out`, { force: true });
+    writeControl(round);
+    const result = runAgentTurn(round);
+    rounds.push(result);
+    console.log(`PROOF agent round=${round} cliStatus=${result.status} ms=${result.ms}`);
+    console.log(`PROOF agent round=${round} output tail: ${result.out.slice(-600)}`);
+  }
+
+  fs.writeFileSync(process.env.SAMPLER_STOP ?? "/tmp/proof-sampler.stop", "stop\n");
+  const samplerExit = await new Promise((resolve) => {
+    if (sampler.exitCode !== null) {
+      resolve(sampler.exitCode);
+      return;
+    }
+    const timer = setTimeout(() => resolve("timeout"), 30_000);
+    sampler.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+  console.log(`PROOF sampler exit=${samplerExit}`);
+
+  const records = [];
+  try {
+    for (const line of fs.readFileSync(process.env.SAMPLER_OUT ?? "", "utf8").split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        records.push(JSON.parse(line));
+      } catch {
+        // Ignore a partially flushed line.
+      }
+    }
+  } catch {
+    // Sampler never wrote; assertions below fail with evidence.
+  }
+  const kinds = { capture: [], validation: [], exec: [] };
+  for (const record of records) {
+    const cmd = record.cmd ?? "";
+    if (!cmd.includes("shell-snapshots/") && !cmd.includes("snapshot.out")) {
+      continue;
+    }
+    if (cmd.includes("PROOF_EXEC_")) {
+      kinds.exec.push(record);
+    } else if (cmd.includes(".tmp")) {
+      kinds.validation.push(record);
+    } else if (cmd.includes("snapshot.out")) {
+      kinds.capture.push(record);
+    }
+  }
+  for (const kind of ["capture", "validation", "exec"]) {
+    for (const record of kinds[kind]) {
+      console.log(`PROOF ${kind} pid=${record.pid} cgroup=${short(record.cg)} cmd=${(record.cmd ?? "").slice(0, 110)}`);
+    }
+  }
+  try {
+    console.log(`PROOF sampler stats ${fs.readFileSync(`${process.env.SAMPLER_OUT}.stats`, "utf8").trim()}`);
+  } catch {
+    console.log("PROOF sampler stats unavailable");
+  }
+
+  const inAgentExec = (record) => short(record.cg).endsWith("agent-exec");
+  const inGateway = (record) => short(record.cg).endsWith("gateway");
+  const markers = rounds.filter((round) => {
+    try {
+      return fs.readFileSync(`/tmp/proof-round-${round.round}.out`, "utf8").includes("SNAPSHOT-WAS-SOURCED");
+    } catch {
+      return false;
+    }
+  });
+  const snapshots = publishedSnapshots();
+
+  check("every agent turn finished through the CLI", rounds.every((round) => round.status === 0), rounds.map((r) => r.status).join(","));
+  check("snapshot published once per distinct workdir", snapshots.length === ROUNDS, `count=${snapshots.length}`);
+  check("every exec shell printed the snapshot-only marker", markers.length === ROUNDS, `${markers.length}/${ROUNDS}`);
+  check("capture shells observed", kinds.capture.length >= ROUNDS, `n=${kinds.capture.length}`);
+  check("capture shells all in agent-exec", kinds.capture.length > 0 && kinds.capture.every(inAgentExec), kinds.capture.map((r) => short(r.cg)).slice(0, 3).join(","));
+  check("validation shells observed", kinds.validation.length >= ROUNDS, `n=${kinds.validation.length}`);
+  check("validation shells all in agent-exec", kinds.validation.length > 0 && kinds.validation.every(inAgentExec), kinds.validation.map((r) => short(r.cg)).slice(0, 3).join(","));
+  check("validation shells never seen in gateway", kinds.validation.every((r) => !inGateway(r)));
+  check("exec shells all in agent-exec", kinds.exec.length > 0 && kinds.exec.every(inAgentExec), `n=${kinds.exec.length}`);
+
+  const gwAfter = gatewayPid() ? readCgroup(gatewayPid()) : undefined;
+  console.log(`PROOF gateway after cgroup=${short(gwAfter)}`);
+  check("gateway process remained in the gateway leaf", short(gwAfter).endsWith("gateway"), short(gwAfter));
+
+  mock.kill("SIGTERM");
+  if (!mockReady) {
+    console.log(`PROOF mock log: ${mockLog.slice(-800)}`);
+  }
+  console.log(`PROOF mock requests: ${fs.existsSync("/tmp/proof-mock-requests.jsonl") ? fs.readFileSync("/tmp/proof-mock-requests.jsonl", "utf8").split("\n").filter(Boolean).length : 0}`);
+
+  const failed = checks.filter((entry) => !entry.ok);
+  console.log(`PROOF VERDICT: ${failed.length === 0 ? "PASS" : "FAIL"}`);
+  process.exitCode = failed.length === 0 ? 0 : 1;
+}
+
+main().catch((error) => {
+  console.log(`PROOF fatal: ${error?.stack ?? error}`);
+  console.log("PROOF VERDICT: FAIL");
+  process.exitCode = 1;
+});
