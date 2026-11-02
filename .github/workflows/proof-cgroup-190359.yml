@@ -188,7 +188,8 @@ jobs:
           # The post-fix Gateway owned this build lock; the unit is stopped now.
           rm -rf .artifacts/dist-artifacts.lock
           git fetch origin main
-          git checkout origin/main -- src/agents/shell-snapshot.ts src/process/spawn-utils.ts
+          # Only the caller is reverted: the helper may stay defined, unused.
+          git checkout origin/main -- src/agents/shell-snapshot.ts
           git diff --stat
           cd ..
           export HOME="$RUNNER_TEMP/oc-gw-home-pre"
