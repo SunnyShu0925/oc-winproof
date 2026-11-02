@@ -171,6 +171,7 @@ async function main() {
   const samplingDone = (async () => {
     while (sampling) {
       sampleIterations += 1;
+      const present = new Set();
       for (const dir of sampleDirs) {
         let raw = "";
         try {
@@ -180,7 +181,9 @@ async function main() {
         }
         for (const line of raw.split("\n")) {
           const pid = Number(line.trim());
-          if (!pid || samples.has(pid)) continue;
+          if (!pid) continue;
+          present.add(pid);
+          if (samples.has(pid)) continue;
           let cmd = "";
           try {
             cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0+/g, " ").trim();
@@ -191,7 +194,7 @@ async function main() {
         }
       }
       for (const entry of samples.values()) {
-        entry.hits += 1;
+        if (present.has(entry.pid)) entry.hits += 1;
         if (entry.cmd) continue;
         // Late cmdline read for a pid first seen mid-spawn.
         try {
@@ -304,7 +307,7 @@ async function main() {
     );
   }
   log(`PROOF sampled pids: ${samples.size}`);
-  for (const entry of [...samples.values()].sort((a, b) => b.hits - a.hits).slice(0, 40)) {
+  for (const entry of [...samples.values()].sort((a, b) => a.pid - b.pid)) {
     log(
       `PROOF sample pid=${entry.pid} hits=${entry.hits} cgroup=${entry.cgroup ?? "(gone)"} cmd=${entry.cmd.slice(0, 90)}`,
     );
