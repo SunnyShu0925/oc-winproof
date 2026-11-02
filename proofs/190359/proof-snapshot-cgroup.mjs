@@ -62,7 +62,7 @@ while (!fs.existsSync(stop)) {
         cmd = fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").replace(/\\0+/g, " ").trim();
       } catch {}
       try {
-        fs.appendFileSync(out, JSON.stringify({ pid, cg, cmd: cmd.slice(0, 200) }) + "\\n");
+        fs.appendFileSync(out, JSON.stringify({ pid, cg, cmd: cmd.slice(0, 4000) }) + "\\n");
       } catch {}
     }
   }
@@ -275,7 +275,7 @@ async function main() {
   }
 
   for (const [pid, info] of [...observed.entries()].sort((a, b) => a[0] - b[0])) {
-    log(`PROOF observed pid=${pid} kind=${info.kind} cgroup=${info.cg ?? "(gone)"} cmd=${info.cmd}`);
+    log(`PROOF observed pid=${pid} kind=${info.kind} cgroup=${info.cg ?? "(gone)"} cmd=${info.cmd.slice(0, 140)}`);
   }
 
   const pick = (kind) => [...observed.entries()].filter(([, info]) => info.kind === kind);
