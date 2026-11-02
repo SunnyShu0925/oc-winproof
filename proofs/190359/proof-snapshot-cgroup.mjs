@@ -163,8 +163,10 @@ async function main() {
   // Only the validation shell needs sampling: one small file read per iteration
   // keeps the sampling interval well below its 1-3ms lifetime.
   const samples = new Map();
-  const sampleDirs = [agentExecDir, agentExecDir ? path.join(path.dirname(agentExecDir), "gateway") : null]
-    .filter(Boolean);
+  const serviceRoot = agentExecDir ? path.dirname(agentExecDir) : null;
+  const sampleDirs = agentExecDir
+    ? [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot]
+    : [];
   let sampling = Boolean(agentExecDir);
   let sampleIterations = 0;
   const sampleStartedAt = Date.now();
