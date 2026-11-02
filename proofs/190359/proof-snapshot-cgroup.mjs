@@ -3,71 +3,36 @@
 // Drives the shipped host-exec preparation path (prepareHostExecSpawn, which owns
 // the snapshot capture and validation shells) and the shipped agent exec spawn
 // owner (spawnProcess with executionIntent "agent-tool") inside a delegated
-// systemd unit, then reads kernel cgroup membership for the specific capture,
-// validation and exec shell PIDs.
+// systemd unit, then checks which cgroup each shell actually landed in.
 //
-// Sampling runs in a separate tight-loop process: the shells under test live in
-// other processes, so a timer-driven sampler in this process misses the
-// short-lived validation shell.
+// Placement is reported by the shells themselves wherever possible, because the
+// exec and validation shells live only 1-3ms:
+//   * ~/.bashrc runs inside the interactive capture shell and records its own
+//     /proc/self/cgroup.
+//   * the exec command and the Gateway-internal control record their own
+//     /proc/<pid>/cgroup from inside the spawned shell.
+//   * only the snapshot validation shell cannot report itself (its environment is
+//     the filtered capture env and it exits immediately), so a tight polling loop
+//     reads the agent-exec leaf and samples its cmdline.
 //
 // Checks:
 //   1. Gateway leaf membership before and after the run
-//   2. capture shell PID in agent-exec
-//   3. validation shell PID in agent-exec
-//   4. exec shell PID in agent-exec
-//   5. the snapshot was captured, validated and actually sourced (marker function
-//      defined only in ~/.bashrc becomes callable in the exec shell)
-//   6. a Gateway-internal control child through the same broker stays in gateway
+//   2. capture shell reported agent-exec
+//   3. validation shell reported agent-exec
+//   4. exec shell reported agent-exec
+//   5. the snapshot was captured and published with the marker function
+//   6. the exec shell actually sourced it (marker defined only in ~/.bashrc)
+//   7. every exec round exited 0
+//   8. a Gateway-internal control child through the same broker reported gateway
 
 import { once } from "node:events";
 import fs from "node:fs";
-import { spawn as nodeSpawn } from "node:child_process";
 import path from "node:path";
 
 const STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/tmp/oc-proof-state";
 const PROOF_LOG = process.env.PROOF_LOG || "";
 const HOME = process.env.HOME || "/tmp/oc-proof-home";
-const GATEWAY_CONTROL_CMD = "sleep 0.8 # PROOF_GATEWAY_CONTROL";
-const SAMPLER_LOG = path.join("/tmp", `proof-cgroup-sampler-${process.pid}.jsonl`);
-
-// Tight-loop sampler. Runs as its own process so sampling continues while this
-// process awaits snapshot creation and child spawns.
-const SAMPLER_SOURCE = `
-const fs = require("node:fs");
-const args = process.argv.slice(1);
-const out = args.pop();
-const stop = out + ".stop";
-const dirs = args;
-const seen = new Set();
-fs.writeFileSync(out, "");
-while (!fs.existsSync(stop)) {
-  for (const dir of dirs) {
-    let raw;
-    try {
-      raw = fs.readFileSync(dir + "/cgroup.procs", "utf8");
-    } catch {
-      continue;
-    }
-    for (const line of raw.split("\\n")) {
-      const pid = Number(line.trim());
-      if (!pid || seen.has(pid)) continue;
-      seen.add(pid);
-      let cg = null;
-      let cmd = "";
-      try {
-        const match = fs.readFileSync("/proc/" + pid + "/cgroup", "utf8").match(/^0::(.+)$/m);
-        cg = match ? match[1].trim() : null;
-      } catch {}
-      try {
-        cmd = fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").replace(/\\0+/g, " ").trim();
-      } catch {}
-      try {
-        fs.appendFileSync(out, JSON.stringify({ pid, cg, cmd: cmd.slice(0, 4000) }) + "\\n");
-      } catch {}
-    }
-  }
-}
-`;
+const CAPTURE_OBS_PATH = "/tmp/proof-capture-obs.txt";
 
 const lines = [];
 function log(message) {
@@ -86,7 +51,7 @@ function finish(code) {
   process.exit(code);
 }
 
-function cgroupV2Path(pid) {
+function readKernelCgroup(pid) {
   try {
     const match = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8").match(/^0::(.+)$/m);
     return match ? match[1].trim() : null;
@@ -97,33 +62,42 @@ function cgroupV2Path(pid) {
 const isGatewayLeaf = (cg) => Boolean(cg && /\/gateway$/.test(cg));
 const isAgentExecLeaf = (cg) => Boolean(cg && /\/agent-exec$/.test(cg));
 
-function classify(cmd) {
-  if (!cmd) return "unknown";
-  if (cmd.includes("proof-cgroup-sampler")) return "sampler";
-  if (cmd.includes("snapshot.out")) return "capture";
-  if (/shell-snapshots\/[0-9a-f]+\.\d+\.\d+\.tmp/.test(cmd)) return "validation";
-  if (cmd.includes("PROOF_GATEWAY_CONTROL")) return "gateway-control";
-  if (cmd.includes("proof_snapshot_marker")) return "exec";
-  return "other";
-}
+// `sed -n s/^0:://p` returns the v2 leaf from /proc/<pid>/cgroup without quoting
+// problems inside the single-quoted eval the snapshot wrapper builds.
+const SELF_CGROUP_CMD = "sed -n s/^0:://p /proc/$$/cgroup";
 
-function readSamplerLog() {
+// Runs inside the interactive capture shell; records the shell's own placement.
+const CAPTURE_NOTE = [
+  "__proof_note() {",
+  `  printf '%s|%s|%s|%s\\n' "$$" "$(sed -n s/^0:://p /proc/$$/cgroup)" "$(tr '\\0\\n' '  ' < /proc/$$/cmdline | cut -c1-300)" "capture" >> ${CAPTURE_OBS_PATH}`,
+  "}",
+  "__proof_note",
+].join("\n");
+
+function readCaptureObservations() {
   const entries = [];
   let raw = "";
   try {
-    raw = fs.readFileSync(SAMPLER_LOG, "utf8");
+    raw = fs.readFileSync(CAPTURE_OBS_PATH, "utf8");
   } catch {
     return entries;
   }
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
-    try {
-      entries.push(JSON.parse(line));
-    } catch {
-      // ignore torn line
-    }
+    const parts = line.split("|");
+    if (parts.length < 4) continue;
+    entries.push({ pid: Number(parts[0]), cgroup: parts[1] || null, cmd: parts[2], kind: parts[3] });
   }
   return entries;
+}
+
+function readSelfCgroupFile(file) {
+  try {
+    const value = fs.readFileSync(file, "utf8").trim();
+    return value || null;
+  } catch {
+    return null;
+  }
 }
 
 async function main() {
@@ -132,12 +106,18 @@ async function main() {
   process.env.HOME = HOME;
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
+  fs.rmSync(CAPTURE_OBS_PATH, { force: true });
 
-  // Only an interactive capture shell sees this; the exec shell runs with
-  // --norc, so the marker printing proves the snapshot was sourced.
+  // Only an interactive capture shell reads this. The marker function exists
+  // nowhere else, so printing it proves the published snapshot was sourced.
   fs.writeFileSync(
     path.join(HOME, ".bashrc"),
-    "proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED\\n'; }\nsleep 0.4\n",
+    [
+      CAPTURE_NOTE,
+      "proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED\\n'; }",
+      "sleep 0.4",
+      "",
+    ].join("\n"),
   );
 
   const { spawnProcess } = await import("../../src/process/spawn-utils.js");
@@ -147,7 +127,7 @@ async function main() {
   const { prepareHostExecSpawn } = await import("../../src/agents/bash-tools.exec-host-spawn.js");
 
   const selfPid = process.pid;
-  const selfBefore = cgroupV2Path(selfPid);
+  const selfBefore = readKernelCgroup(selfPid);
   log(`PROOF self cgroup (before): ${selfBefore}`);
   log(`PROOF self in gateway leaf (before): ${isGatewayLeaf(selfBefore)}`);
 
@@ -159,10 +139,8 @@ async function main() {
   }
   log(`PROOF initializeGatewayExecCgroup: ${initMessage}`);
   const agentExecDir = cgroupMod.getAgentExecCgroup();
-  const serviceRoot = agentExecDir ? path.dirname(agentExecDir) : null;
-  const gatewayDir = serviceRoot ? path.join(serviceRoot, "gateway") : null;
   log(`PROOF getAgentExecCgroup: ${agentExecDir ?? "(undefined)"}`);
-  log(`PROOF service cgroup root: ${serviceRoot ?? "(none)"}`);
+  log(`PROOF service cgroup root: ${agentExecDir ? path.dirname(agentExecDir) : "(none)"}`);
 
   let broker = null;
   if (agentExecDir) {
@@ -172,124 +150,157 @@ async function main() {
     });
   }
 
-  // Start the sampler outside the broker context so it stays in the gateway leaf
-  // and never confuses the placement it is observing.
-  const samplerDirs = [agentExecDir, gatewayDir].filter(Boolean);
-  const sampler = nodeSpawn(
-    process.execPath,
-    ["-e", SAMPLER_SOURCE, ...samplerDirs, SAMPLER_LOG],
-    { stdio: "ignore" },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  // Only the validation shell needs sampling: one small file read per iteration
+  // keeps the sampling interval well below its 1-3ms lifetime.
+  const samples = new Map();
+  let sampling = Boolean(agentExecDir);
+  const samplingDone = (async () => {
+    while (sampling) {
+      let raw = "";
+      try {
+        raw = fs.readFileSync(path.join(agentExecDir, "cgroup.procs"), "utf8");
+      } catch {
+        raw = "";
+      }
+      for (const line of raw.split("\n")) {
+        const pid = Number(line.trim());
+        if (!pid || samples.has(pid)) continue;
+        let cmd = "";
+        try {
+          cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0+/g, " ").trim();
+        } catch {
+          cmd = "";
+        }
+        samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid) });
+      }
+      for (const entry of samples.values()) {
+        if (entry.cmd) continue;
+        // Late cmdline read for a pid first seen mid-spawn.
+        try {
+          const cmd = fs
+            .readFileSync(`/proc/${entry.pid}/cmdline`, "utf8")
+            .replace(/\0+/g, " ")
+            .trim();
+          if (cmd) entry.cmd = cmd;
+        } catch {
+          // still gone
+        }
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  })();
 
   const markerPaths = [];
+  const execCgroupPaths = [];
   const roundExitCodes = [];
+  const controlCgroupPath = "/tmp/proof-control-cgroup.txt";
   let wrappedArgv = [];
 
-  try {
-    const runRounds = broker
-      ? () => brokerMod.runWithSpawnBroker(broker, round)
-      : () => round();
-
-    async function round() {
-      // Distinct workdirs produce distinct snapshot keys, so a retry re-runs the
-      // real capture and validation shells instead of reusing a cached snapshot.
-      for (const index of [1, 2, 3]) {
-        const workdir = `/tmp/proof-shell-snapshot-wd-${index}`;
-        fs.mkdirSync(workdir, { recursive: true });
-        const markerPath = `/tmp/proof-exec-marker-${index}.txt`;
-        markerPaths.push(markerPath);
-        fs.rmSync(markerPath, { force: true });
-        const spawnSpec = await prepareHostExecSpawn({
-          command: `proof_snapshot_marker > ${markerPath}`,
-          workdir,
-          env: { ...process.env },
-          usePty: false,
-        });
-        wrappedArgv = spawnSpec.argv;
-        const child = spawnProcess(
-          spawnSpec.argv[0],
-          spawnSpec.argv.slice(1),
-          {
-            cwd: spawnSpec.cwd,
-            env: spawnSpec.env,
-            stdio: ["ignore", "ignore", "ignore"],
-          },
-          undefined,
-          "agent-tool",
-        );
-        const [code] = await once(child, "close");
-        roundExitCodes.push(code);
-      }
-
-      // Gateway-internal control: same broker, no agent intent.
-      const control = spawnProcess(
-        "/bin/bash",
-        ["-c", GATEWAY_CONTROL_CMD],
-        { stdio: "ignore" },
+  async function round() {
+    // Distinct workdirs produce distinct snapshot keys, so each round re-runs the
+    // real capture and validation shells instead of reusing a cached snapshot.
+    for (const index of [1, 2, 3]) {
+      const workdir = `/tmp/proof-shell-snapshot-wd-${index}`;
+      fs.mkdirSync(workdir, { recursive: true });
+      const markerPath = `/tmp/proof-exec-marker-${index}.txt`;
+      const execCgroupPath = `/tmp/proof-exec-cgroup-${index}.txt`;
+      markerPaths.push(markerPath);
+      execCgroupPaths.push(execCgroupPath);
+      fs.rmSync(markerPath, { force: true });
+      fs.rmSync(execCgroupPath, { force: true });
+      const spawnSpec = await prepareHostExecSpawn({
+        command: `proof_snapshot_marker > ${markerPath}; ${SELF_CGROUP_CMD} > ${execCgroupPath}`,
+        workdir,
+        env: { ...process.env },
+        usePty: false,
+      });
+      wrappedArgv = spawnSpec.argv;
+      const child = spawnProcess(
+        spawnSpec.argv[0],
+        spawnSpec.argv.slice(1),
+        {
+          cwd: spawnSpec.cwd,
+          env: spawnSpec.env,
+          stdio: ["ignore", "ignore", "ignore"],
+        },
         undefined,
-        "gateway-internal",
+        "agent-tool",
       );
-      controlPid = control.pid ?? null;
-      controlLive = controlPid ? cgroupV2Path(controlPid) : null;
-      await once(control, "close");
+      const [code] = await once(child, "close");
+      roundExitCodes.push(code);
     }
 
-    await runRounds();
+    // Gateway-internal control: same broker, no agent intent.
+    fs.rmSync(controlCgroupPath, { force: true });
+    const control = spawnProcess(
+      "/bin/bash",
+      ["-c", `${SELF_CGROUP_CMD} > ${controlCgroupPath}; sleep 0.2`],
+      { stdio: "ignore", env: { ...process.env } },
+      undefined,
+      "gateway-internal",
+    );
+    await once(control, "close");
+  }
+
+  try {
+    if (broker) {
+      await brokerMod.runWithSpawnBroker(broker, round);
+    } else {
+      await round();
+    }
   } catch (error) {
+    sampling = false;
+    await samplingDone;
     log(`PROOF ERROR during run: ${error?.stack ?? error}`);
-    fs.writeFileSync(`${SAMPLER_LOG}.stop`, "");
-    sampler.kill("SIGKILL");
     finish(2);
   }
 
+  sampling = false;
+  await samplingDone;
   try {
     await broker?.close?.();
   } catch {
     // ignore
   }
 
-  fs.writeFileSync(`${SAMPLER_LOG}.stop`, "");
-  try {
-    await once(sampler, "exit");
-  } catch {
-    sampler.kill("SIGKILL");
-  }
-
-  const selfAfter = cgroupV2Path(selfPid);
+  const selfAfter = readKernelCgroup(selfPid);
   log(`PROOF self cgroup (after): ${selfAfter}`);
   log(`PROOF self remained in gateway leaf: ${isGatewayLeaf(selfAfter)}`);
 
-  const observed = new Map();
-  for (const entry of readSamplerLog()) {
-    if (entry.pid === selfPid || entry.pid === sampler.pid) continue;
-    if (observed.has(entry.pid)) continue;
-    observed.set(entry.pid, {
-      cg: entry.cg,
-      kind: classify(entry.cmd),
-      cmd: entry.cmd,
-    });
-  }
-  if (controlPid && !observed.has(controlPid)) {
-    observed.set(controlPid, { cg: controlLive, kind: "gateway-control", cmd: GATEWAY_CONTROL_CMD });
+  const captureNotes = readCaptureObservations();
+  for (const note of captureNotes) {
+    log(
+      `PROOF observed capture pid=${note.pid} cgroup=${note.cgroup ?? "(unreadable)"} cmd=${note.cmd}`,
+    );
   }
 
-  for (const [pid, info] of [...observed.entries()].sort((a, b) => a[0] - b[0])) {
-    log(`PROOF observed pid=${pid} kind=${info.kind} cgroup=${info.cg ?? "(gone)"} cmd=${info.cmd.slice(0, 140)}`);
+  const validationSamples = [...samples.values()].filter((entry) =>
+    /shell-snapshots\/[0-9a-f]+\.\d+\.\d+\.tmp/.test(entry.cmd),
+  );
+  for (const sample of validationSamples) {
+    log(
+      `PROOF observed validation pid=${sample.pid} cgroup=${sample.cgroup ?? "(unreadable)"} cmd=${sample.cmd}`,
+    );
   }
+  log(`PROOF sampled agent-exec pids: ${samples.size}`);
 
-  const pick = (kind) => [...observed.entries()].filter(([, info]) => info.kind === kind);
-  const inAgentExec = ([, info]) => isAgentExecLeaf(info.cg);
-  const inGateway = ([, info]) => isGatewayLeaf(info.cg);
+  const execPlacements = execCgroupPaths.map((file, index) => ({
+    index: index + 1,
+    cgroup: readSelfCgroupFile(file),
+  }));
+  for (const placement of execPlacements) {
+    log(
+      `PROOF observed exec round=${placement.index} cgroup=${placement.cgroup ?? "(no self-report)"}`,
+    );
+  }
+  const controlCgroup = readSelfCgroupFile(controlCgroupPath);
+  log(`PROOF observed gateway-control cgroup=${controlCgroup ?? "(no self-report)"}`);
 
-  const capture = pick("capture");
-  const validation = pick("validation");
-  const execShell = pick("exec");
-  const control = pick("gateway-control");
-  log(`PROOF capture shell pids: ${capture.map((e) => e[0]).join(",") || "(none)"}`);
-  log(`PROOF validation shell pids: ${validation.map((e) => e[0]).join(",") || "(none)"}`);
-  log(`PROOF exec shell pids: ${execShell.map((e) => e[0]).join(",") || "(none)"}`);
-  log(`PROOF gateway control pids: ${control.map((e) => e[0]).join(",") || "(none)"}`);
+  log(`PROOF capture shell pids: ${captureNotes.map((e) => e.pid).join(",") || "(none)"}`);
+  log(`PROOF validation shell pids: ${validationSamples.map((e) => e.pid).join(",") || "(none)"}`);
+  log(
+    `PROOF exec self-reports: ${execPlacements.filter((e) => e.cgroup).length}/${execPlacements.length}`,
+  );
 
   const snapshotDir = path.join(STATE_DIR, "cache", "shell-snapshots");
   let snapshotFiles = [];
@@ -308,8 +319,7 @@ async function main() {
       return false;
     }
   });
-  const publishedSnapshots = snapshotFiles.length;
-  log(`PROOF published snapshot count: ${publishedSnapshots}`);
+  log(`PROOF published snapshot count: ${snapshotFiles.length}`);
   log(`PROOF snapshot captures marker function: ${snapshotWithMarker}`);
 
   const markerOutputs = markerPaths.map((file) => {
@@ -329,14 +339,20 @@ async function main() {
   const checks = [
     ["self in gateway before", isGatewayLeaf(selfBefore)],
     ["agent-exec cgroup available", Boolean(agentExecDir)],
-    ["capture shell PID in agent-exec", capture.some(inAgentExec)],
-    ["validation shell PID in agent-exec", validation.some(inAgentExec)],
-    ["exec shell PID in agent-exec", execShell.some(inAgentExec)],
+    ["capture shell reported agent-exec", captureNotes.some((e) => isAgentExecLeaf(e.cgroup))],
+    [
+      "validation shell reported agent-exec",
+      validationSamples.some((e) => isAgentExecLeaf(e.cgroup)),
+    ],
+    ["exec shell reported agent-exec", execPlacements.some((e) => isAgentExecLeaf(e.cgroup))],
     ["snapshot published with marker function", snapshotWithMarker],
-    ["wrapped command sourced snapshot", wrappedUsesSnapshot],
-    ["snapshot used: marker printed by every round", markersPrinted.length === markerOutputs.length && markerOutputs.length > 0],
-    ["exec rounds exited 0", roundExitCodes.length > 0 && roundExitCodes.every((code) => code === 0)],
-    ["gateway-internal control stayed in gateway", control.some(inGateway)],
+    ["wrapped command sources snapshot", wrappedUsesSnapshot],
+    [
+      "snapshot used: marker printed by every round",
+      markerOutputs.length > 0 && markersPrinted.length === markerOutputs.length,
+    ],
+    ["exec rounds exited 0", roundExitCodes.length > 0 && roundExitCodes.every((c) => c === 0)],
+    ["gateway-internal control reported gateway", isGatewayLeaf(controlCgroup)],
     ["self remained in gateway after", isGatewayLeaf(selfAfter)],
   ];
   for (const [name, ok] of checks) {
@@ -346,8 +362,5 @@ async function main() {
   log(`PROOF VERDICT: ${failed.length === 0 ? "PASS" : "FAIL"}`);
   finish(failed.length === 0 ? 0 : 1);
 }
-
-let controlPid = null;
-let controlLive = null;
 
 await main();
