@@ -113,39 +113,39 @@ jobs:
             printf '%s' "$PROOF_OPENCLAW_CONFIG" > "$OPENCLAW_CONFIG_PATH"
           else
             export OPENAI_API_KEY="proof-stub-key"
-            cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
-            {
-              "gateway": { "mode": "local", "port": 18787 },
-              "models": {
-                "mode": "merge",
-                "providers": {
-                  "openai": {
-                    "baseUrl": "http://127.0.0.1:18799/v1",
-                    "api": "openai-completions",
-                    "apiKey": "proof-stub-key",
-                    "agentRuntime": { "id": "openclaw" },
-                    "request": { "allowPrivateNetwork": true },
-                    "models": [
-                      {
-                        "id": "gpt-5.6-luna",
-                        "name": "gpt-5.6-luna",
-                        "api": "openai-completions",
-                        "agentRuntime": { "id": "openclaw" },
-                        "reasoning": false,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 128000,
-                        "contextTokens": 96000,
-                        "maxTokens": 4096
-                      }
-                    ]
-                  }
+          cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
+          {
+            "gateway": { "mode": "local", "port": 18787 },
+            "models": {
+              "mode": "merge",
+              "providers": {
+                "openai": {
+                  "baseUrl": "http://127.0.0.1:18799/v1",
+                  "api": "openai-completions",
+                  "apiKey": "proof-stub-key",
+                  "agentRuntime": { "id": "openclaw" },
+                  "request": { "allowPrivateNetwork": true },
+                  "models": [
+                    {
+                      "id": "gpt-5.6-luna",
+                      "name": "gpt-5.6-luna",
+                      "api": "openai-completions",
+                      "agentRuntime": { "id": "openclaw" },
+                      "reasoning": false,
+                      "input": ["text"],
+                      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                      "contextWindow": 128000,
+                      "contextTokens": 96000,
+                      "maxTokens": 4096
+                    }
+                  ]
                 }
-              },
-              "agents": { "defaults": { "model": { "primary": "openai/gpt-5.6-luna" } } },
-              "tools": { "exec": { "mode": "full", "host": "gateway" } }
-            }
-            CFG
+              }
+            },
+            "agents": { "defaults": { "model": { "primary": "openai/gpt-5.6-luna" } } },
+            "tools": { "exec": { "mode": "full", "host": "gateway" } }
+          }
+          CFG
           fi
           systemd-run --user --unit=oc-proof-gw \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
