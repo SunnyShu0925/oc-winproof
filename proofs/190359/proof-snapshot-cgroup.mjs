@@ -25,6 +25,7 @@
 //   7. every exec round exited 0
 //   8. a Gateway-internal control child through the same broker reported gateway
 
+import { spawn as nodeSpawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -191,6 +192,14 @@ function readSamplerRows() {
 }
 
 async function main() {
+  // Never let a stuck helper keep the job alive; the happy path finishes in a
+  // few seconds and every await below is bounded.
+  const watchdog = setTimeout(() => {
+    log("PROOF TIMEOUT: watchdog expired");
+    finish(4);
+  }, 120_000);
+  watchdog.unref?.();
+
   process.env.SHELL = "/bin/bash";
   process.env.OPENCLAW_STATE_DIR = STATE_DIR;
   process.env.HOME = HOME;
@@ -252,22 +261,19 @@ async function main() {
   let sampler = null;
   if (serviceRoot) {
     fs.writeFileSync(SAMPLER_SCRIPT, SAMPLER_SOURCE);
-    sampler = spawnProcess(
-      process.execPath,
-      [SAMPLER_SCRIPT],
-      {
-        stdio: "ignore",
-        env: {
-          ...process.env,
-          SAMPLER_DIRS: [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot].join(","),
-          SAMPLER_OUT,
-          SAMPLER_READY,
-          SAMPLER_STOP,
-        },
+    // Plain child_process: the instrument must not travel through the path it
+    // measures, and inheriting this process's cgroup keeps it in gateway.
+    sampler = nodeSpawn(process.execPath, [SAMPLER_SCRIPT], {
+      stdio: "ignore",
+      detached: false,
+      env: {
+        ...process.env,
+        SAMPLER_DIRS: [agentExecDir, path.join(serviceRoot, "gateway"), serviceRoot].join(","),
+        SAMPLER_OUT,
+        SAMPLER_READY,
+        SAMPLER_STOP,
       },
-      undefined,
-      "gateway-internal",
-    );
+    });
     const waitUntil = Date.now() + 15_000;
     while (!fs.existsSync(SAMPLER_READY) && Date.now() < waitUntil) {
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -352,7 +358,15 @@ async function main() {
     while (!fs.existsSync(`${SAMPLER_STOP}.done`) && Date.now() < waitUntil) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await once(sampler, "close").catch(() => undefined);
+    try {
+      sampler.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+    await Promise.race([
+      once(sampler, "close").catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 3_000)),
+    ]);
   }
   try {
     await broker?.close?.();

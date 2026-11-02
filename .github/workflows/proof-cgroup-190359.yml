@@ -66,6 +66,7 @@ jobs:
           echo "app.slice controllers: $(cat $USERSVC/app.slice/cgroup.controllers)"
 
       - name: Run post-fix proof (PR head)
+        timeout-minutes: 8
         run: |
           set -x
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -91,6 +92,7 @@ jobs:
           cat "$PROOF_LOG" || true
 
       - name: Run pre-fix proof (main, revert the one-line fix)
+        timeout-minutes: 8
         run: |
           set -x
           cd openclaw
