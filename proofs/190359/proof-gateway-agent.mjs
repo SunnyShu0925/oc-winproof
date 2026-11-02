@@ -99,7 +99,7 @@ function writeControl(round) {
       text: `round ${round} complete`,
       toolCall: {
         name: "exec",
-        args: {
+        arguments: {
           // `proof_snapshot_marker` exists only in the interactive rc file, so a
           // marker file proves this shell sourced the published snapshot.
           command: `# PROOF_EXEC_${round}\nproof_snapshot_marker > /tmp/proof-round-${round}.out\n`,
