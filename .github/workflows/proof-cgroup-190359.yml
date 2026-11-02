@@ -84,6 +84,7 @@ jobs:
             --setenv=HOME="$HOME" \
             --setenv=PROOF_LOG="$PROOF_LOG" \
             --setenv=PATH="$PATH" \
+            --setenv=SHELL=/bin/bash \
             bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
             2>&1 | tee "$RUNNER_TEMP/postfix-stdout.log" || true
           echo "=== post-fix proof log ==="
@@ -110,6 +111,7 @@ jobs:
             --setenv=HOME="$HOME" \
             --setenv=PROOF_LOG="$PROOF_LOG" \
             --setenv=PATH="$PATH" \
+            --setenv=SHELL=/bin/bash \
             bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
             2>&1 | tee "$RUNNER_TEMP/prefix-stdout.log" || true
           echo "=== pre-fix proof log ==="
