@@ -95,6 +95,8 @@ jobs:
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           cat > "$HOME/.bashrc" <<'BASHRC'
+          # The interactive shell reports the cgroup the kernel actually put it in.
+          printf '%s %s\n' "$$" "$(sed -n 's|^0::||p' /proc/$$/cgroup 2>/dev/null)" >> /tmp/proof-capture-cgroups.txt
           # Exists only in this file, so printing it proves a published snapshot was sourced.
           proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED'; }
           for i in $(seq 1 500); do alias proof_alias_$i='true'; done
@@ -191,7 +193,8 @@ jobs:
           export OPENAI_API_KEY="proof-stub-key"
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
-          cp "$RUNNER_TEMP/oc-gw-home/.bashrc" "$HOME/.bashrc"
+          sed 's|/tmp/proof-capture-cgroups.txt|/tmp/proof-capture-cgroups-pre.txt|' \
+            "$RUNNER_TEMP/oc-gw-home/.bashrc" > "$HOME/.bashrc"
           sed -e 's/18799/18798/' -e 's/18787/18788/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
           (cd openclaw && OPENCLAW_FORCE_BUILD=1 pnpm openclaw --version)
           systemd-run --user --unit=oc-proof-gw-pre \
@@ -222,6 +225,7 @@ jobs:
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw-pre" \
+          PROOF_TAG="-pre" \
           node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
           tail -40 /tmp/oc-gw-pre.log || true
           systemctl --user stop oc-proof-gw-pre || true

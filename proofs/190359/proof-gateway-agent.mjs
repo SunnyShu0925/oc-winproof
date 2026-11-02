@@ -185,6 +185,27 @@ function publishedSnapshots() {
   }
 }
 
+/**
+ * The capture shell sources the interactive rc file, which appends the cgroup the
+ * kernel put that shell in. Sampling a millisecond-lived process can miss it; the
+ * shell's own report cannot.
+ */
+function captureSelfReports() {
+  const tag = process.env.PROOF_TAG ?? "";
+  try {
+    return fs
+      .readFileSync(`/tmp/proof-capture-cgroups${tag}.txt`, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [pid, cgroup] = line.trim().split(" ");
+        return { pid: Number(pid), cgroup: cgroup ?? "" };
+      });
+  } catch {
+    return [];
+  }
+}
+
 async function main() {
   console.log(`PROOF gateway ${HTTP} unit=${UNIT} repo=${REPO}`);
 
@@ -210,10 +231,22 @@ async function main() {
   check("gateway answered /readyz", ready);
   check("gateway process runs in the service gateway leaf", short(gwBefore).endsWith("gateway"), short(gwBefore));
 
+  // Every process in the gateway leaf is a root: whichever wrapper actually
+  // forks the snapshot shells, its whole subtree stays visible to the sampler.
+  const samplerRoots = [];
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/u.test(entry)) {
+      continue;
+    }
+    const cgroup = readCgroup(entry);
+    if (cgroup && short(cgroup).endsWith("gateway")) {
+      samplerRoots.push(entry);
+    }
+  }
   const sampler = spawn(process.execPath, [`${REPO}/proofs/190359/proof-cgroup-sampler.mjs`], {
     cwd: REPO,
     stdio: ["ignore", "ignore", "inherit"],
-    env: process.env,
+    env: { ...process.env, SAMPLER_ROOTS: samplerRoots.join(",") },
   });
   const readyDeadline = Date.now() + 30_000;
   while (Date.now() < readyDeadline && !fs.existsSync(process.env.SAMPLER_READY ?? "")) {
@@ -303,6 +336,7 @@ async function main() {
     }
   });
   const snapshots = publishedSnapshots();
+  const reports = captureSelfReports();
   // A launcher starts in the Gateway leaf and moves itself into agent-exec before
   // it execs the shell, so a shell that kept the launcher pid legitimately has a
   // Gateway first observation. Everything else must never touch that leaf.
@@ -319,7 +353,8 @@ async function main() {
   check("every agent turn finished through the CLI", rounds.every((round) => round.status === 0), rounds.map((r) => r.status).join(","));
   check("snapshot published once per distinct workdir", snapshots.length === ROUNDS, `count=${snapshots.length}`);
   check("every exec shell printed the snapshot-only marker", markers.length === ROUNDS, `${markers.length}/${ROUNDS}`);
-  check("capture shells observed", kinds.capture.length >= ROUNDS, `n=${kinds.capture.length}`);
+  check("capture shells report agent-exec", reports.length >= ROUNDS && reports.every((row) => short(row.cgroup).endsWith("agent-exec")), reports.map((row) => short(row.cgroup)).slice(0, 3).join(",") || "none");
+  check("capture shells observed", kinds.capture.length >= 1, `n=${kinds.capture.length}`);
   check("capture shells all in agent-exec", kinds.capture.length > 0 && kinds.capture.every(endsInAgentExec), kinds.capture.map((r) => short(r.lastCg)).slice(0, 3).join(","));
   check("validation shells observed", kinds.validation.length >= 1, `n=${kinds.validation.length}`);
   check("validation shells all in agent-exec", kinds.validation.length > 0 && kinds.validation.every(endsInAgentExec), kinds.validation.map((r) => short(r.lastCg)).slice(0, 3).join(","));
