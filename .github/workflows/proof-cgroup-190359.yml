@@ -174,12 +174,16 @@ jobs:
         timeout-minutes: 18
         run: |
           set -x
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          systemctl --user stop oc-proof-gw || true
+          systemctl --user reset-failed oc-proof-gw || true
           cd openclaw
+          # The post-fix Gateway owned this build lock; the unit is stopped now.
+          rm -rf .artifacts/dist-artifacts.lock
           git fetch origin main
           git checkout origin/main -- src/agents/shell-snapshot.ts
           git diff --stat
           cd ..
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           export HOME="$RUNNER_TEMP/oc-gw-home-pre"
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state-pre"
           export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config-pre.json"
