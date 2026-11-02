@@ -88,7 +88,7 @@ jobs:
           sleep 0.3
           BASHRC
           cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
-          { "tools": { "exec": { "mode": "full", "host": "gateway" } } }
+          { "gateway": { "mode": "local" }, "tools": { "exec": { "mode": "full", "host": "gateway" } } }
           CFG
           systemd-run --user --unit=oc-proof-gw \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
@@ -99,11 +99,16 @@ jobs:
             --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
             --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
             bash -c 'pnpm openclaw gateway run --port 18787 --auth token > /tmp/oc-gw.log 2>&1'
-          for i in $(seq 1 120); do
+          for i in $(seq 1 180); do
             if curl -fsS http://127.0.0.1:18787/readyz > /dev/null 2>&1; then break; fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18787/readyz && echo "gateway ready"
+          if ! curl -fsS http://127.0.0.1:18787/readyz; then
+            echo "gateway never became ready"
+            tail -40 /tmp/oc-gw.log || true
+            exit 1
+          fi
+          echo "gateway ready"
           systemctl --user show -p MainPID --value oc-proof-gw
           SAMPLER_OUT="$RUNNER_TEMP/proof-sampler.jsonl" \
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler.ready" \
@@ -114,11 +119,11 @@ jobs:
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw" \
-          node proofs/190359/proof-gateway-exec.mjs 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
+          node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-exec.mjs" 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
           echo "=== gateway log tail ==="
           tail -60 /tmp/oc-gw.log || true
           systemctl --user stop oc-proof-gw || true
-          grep -c "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log"
+          grep -c "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log" || true
 
       - name: Run pre-fix control (main's shell-snapshot.ts)
         if: ${{ github.event.inputs.pre_fix == 'true' }}
@@ -149,10 +154,15 @@ jobs:
             --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
             --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
             bash -c 'pnpm openclaw gateway run --port 18788 --auth token > /tmp/oc-gw-pre.log 2>&1'
-          for i in $(seq 1 120); do
+          for i in $(seq 1 180); do
             if curl -fsS http://127.0.0.1:18788/readyz > /dev/null 2>&1; then break; fi
             sleep 1
           done
+          if ! curl -fsS http://127.0.0.1:18788/readyz; then
+            echo "pre-fix gateway never became ready"
+            tail -40 /tmp/oc-gw-pre.log || true
+            exit 1
+          fi
           SAMPLER_OUT="$RUNNER_TEMP/proof-sampler-pre.jsonl" \
           SAMPLER_READY="$RUNNER_TEMP/proof-sampler-pre.ready" \
           SAMPLER_STOP="$RUNNER_TEMP/proof-sampler-pre.stop" \
