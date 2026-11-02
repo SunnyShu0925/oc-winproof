@@ -110,15 +110,25 @@ async function main() {
 
   // Only an interactive capture shell reads this. The marker function exists
   // nowhere else, so printing it proves the published snapshot was sourced.
+  // The alias block is a realistic heavy startup file: it makes the snapshot big
+  // enough that the validation shell lives long enough to be observed, and
+  // placement does not depend on snapshot size.
+  const ALIAS_COUNT = 800;
+  const aliasLines = Array.from(
+    { length: ALIAS_COUNT },
+    (_, index) => `alias proof_alias_${index}='ls -l'`,
+  );
   fs.writeFileSync(
     path.join(HOME, ".bashrc"),
     [
       CAPTURE_NOTE,
       "proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED\\n'; }",
+      ...aliasLines,
       "sleep 0.4",
       "",
     ].join("\n"),
   );
+  log(`PROOF bashrc aliases: ${ALIAS_COUNT}`);
 
   const { spawnProcess } = await import("../../src/process/spawn-utils.js");
   const cgroupMod = await import("../../src/process/linux-exec-cgroup.js");
@@ -171,9 +181,10 @@ async function main() {
         } catch {
           cmd = "";
         }
-        samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid) });
+        samples.set(pid, { pid, cmd, cgroup: readKernelCgroup(pid), hits: 1 });
       }
       for (const entry of samples.values()) {
+        entry.hits += 1;
         if (entry.cmd) continue;
         // Late cmdline read for a pid first seen mid-spawn.
         try {
@@ -279,7 +290,7 @@ async function main() {
   );
   for (const sample of validationSamples) {
     log(
-      `PROOF observed validation pid=${sample.pid} cgroup=${sample.cgroup ?? "(unreadable)"} cmd=${sample.cmd}`,
+      `PROOF observed validation pid=${sample.pid} cgroup=${sample.cgroup ?? "(unreadable)"} samples=${sample.hits} cmd=${sample.cmd}`,
     );
   }
   log(`PROOF sampled agent-exec pids: ${samples.size}`);
