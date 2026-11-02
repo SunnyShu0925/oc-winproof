@@ -39,7 +39,7 @@ jobs:
         run: |
           echo "openclaw head: $(git -C openclaw rev-parse HEAD)"
           git -C openclaw log --oneline -2
-          grep -n 'agent-tool' openclaw/src/agents/shell-snapshot.ts
+          grep -n 'spawnPlacedAgentShell' openclaw/src/agents/shell-snapshot.ts openclaw/src/process/spawn-utils.ts
 
       - name: Copy proof scripts into openclaw tree
         run: |
@@ -188,7 +188,7 @@ jobs:
           # The post-fix Gateway owned this build lock; the unit is stopped now.
           rm -rf .artifacts/dist-artifacts.lock
           git fetch origin main
-          git checkout origin/main -- src/agents/shell-snapshot.ts
+          git checkout origin/main -- src/agents/shell-snapshot.ts src/process/spawn-utils.ts
           git diff --stat
           cd ..
           export HOME="$RUNNER_TEMP/oc-gw-home-pre"
