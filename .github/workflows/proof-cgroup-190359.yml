@@ -49,6 +49,12 @@ jobs:
       - name: Enable pnpm
         run: corepack enable pnpm
 
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
+          sudo rm -rf /usr/local/share/boost /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h /
+
       - name: Install dependencies
         working-directory: openclaw
         run: pnpm install --frozen-lockfile
