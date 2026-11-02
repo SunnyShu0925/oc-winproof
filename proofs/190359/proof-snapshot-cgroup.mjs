@@ -104,6 +104,15 @@ async function main() {
 
   // Drive the real snapshot capture path inside the broker context.
   const home = process.env.HOME;
+  // Snapshot capture runs an interactive bash that sources ~/.bashrc. Add a
+  // short sleep there so the capture shell stays in agent-exec long enough for
+  // the poller to observe its cgroup membership (snapshot capture is otherwise
+  // sub-millisecond).
+  try {
+    fs.writeFileSync(path.join(home, ".bashrc"), "sleep 0.5\n");
+  } catch {
+    // ignore
+  }
   const env = { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, HOME: home };
   const wrappedPromise = runWithSpawnBroker(broker, () =>
     maybeWrapCommandWithShellSnapshot({

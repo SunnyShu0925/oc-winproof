@@ -76,7 +76,8 @@ jobs:
           export PROOF_LOG="$RUNNER_TEMP/proof-postfix.log"
           # Run inside a delegated transient unit so the process lands in
           # <service>/gateway leaf (matches resolveGatewayServiceCgroupDirectory).
-          systemd-run --user --unit=oc-proof-postfix \
+          # --wait blocks until the unit finishes so we capture the full proof log.
+          systemd-run --user --wait --unit=oc-proof-postfix \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
             --working-directory="$GITHUB_WORKSPACE/openclaw" \
             --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
@@ -84,14 +85,9 @@ jobs:
             --setenv=PROOF_LOG="$PROOF_LOG" \
             --setenv=PATH="$PATH" \
             bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
-            > "$RUNNER_TEMP/postfix-stdout.log" 2>&1 || true
-          sleep 2
-          echo "=== post-fix stdout ==="
-          cat "$RUNNER_TEMP/postfix-stdout.log" || true
+            2>&1 | tee "$RUNNER_TEMP/postfix-stdout.log" || true
           echo "=== post-fix proof log ==="
           cat "$PROOF_LOG" || true
-          journalctl --user -u oc-proof-postfix --no-pager -n 50 2>&1 || true
-          systemctl --user stop oc-proof-postfix 2>&1 || true
 
       - name: Run pre-fix proof (main, revert the one-line fix)
         run: |
@@ -107,7 +103,7 @@ jobs:
           mkdir -p "$OPENCLAW_STATE_DIR" "$HOME"
           chmod 700 "$OPENCLAW_STATE_DIR" "$HOME"
           export PROOF_LOG="$RUNNER_TEMP/proof-prefix.log"
-          systemd-run --user --unit=oc-proof-prefix \
+          systemd-run --user --wait --unit=oc-proof-prefix \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
             --working-directory="$GITHUB_WORKSPACE/openclaw" \
             --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
@@ -115,14 +111,9 @@ jobs:
             --setenv=PROOF_LOG="$PROOF_LOG" \
             --setenv=PATH="$PATH" \
             bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
-            > "$RUNNER_TEMP/prefix-stdout.log" 2>&1 || true
-          sleep 2
-          echo "=== pre-fix stdout ==="
-          cat "$RUNNER_TEMP/prefix-stdout.log" || true
+            2>&1 | tee "$RUNNER_TEMP/prefix-stdout.log" || true
           echo "=== pre-fix proof log ==="
           cat "$PROOF_LOG" || true
-          journalctl --user -u oc-proof-prefix --no-pager -n 50 2>&1 || true
-          systemctl --user stop oc-proof-prefix 2>&1 || true
 
       - name: Upload proof logs
         if: always()
