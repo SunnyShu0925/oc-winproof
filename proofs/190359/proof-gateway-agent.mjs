@@ -50,9 +50,64 @@ function short(cgroup) {
   return cgroup.split("/").filter(Boolean).slice(-3).join("/");
 }
 
-/** The Gateway node process: only one matching pid sits in the gateway leaf. */
-function gatewayPid() {
+/**
+ * Every process the proof can see inside the proof unit, with its parent, so a
+ * capture shell that kept the Gateway cgroup can be told apart from one the
+ * spawn broker placed: the broker is a separate child process of the Gateway.
+ */
+function dumpUnitProcesses() {
+  const rows = [];
   for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/u.test(entry)) {
+      continue;
+    }
+    const cgroup = readCgroup(entry);
+    if (!cgroup || !short(cgroup).includes(UNIT)) {
+      continue;
+    }
+    let cmd = "";
+    try {
+      cmd = fs.readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").join(" ").trim();
+    } catch {
+      continue;
+    }
+    let ppid = "?";
+    try {
+      ppid = /^PPid:\s+(\d+)$/mu.exec(fs.readFileSync(`/proc/${entry}/status`, "utf8"))?.[1] ?? "?";
+    } catch {
+      // A process that exited between scans still reports its cgroup.
+    }
+    rows.push(`PROOF proc pid=${entry} ppid=${ppid} cgroup=${short(cgroup)} cmd=${cmd.slice(0, 80)}`);
+  }
+  for (const row of rows) {
+    console.log(row);
+  }
+  const gwRoot = (() => {
+    const pid = gatewayPid();
+    const cgroup = pid ? readCgroup(pid) : undefined;
+    return cgroup ? `/sys/fs/cgroup${cgroup.replace(/\/gateway$/u, "")}` : undefined;
+  })();
+  if (!gwRoot) {
+    console.log("PROOF delegation root unresolved");
+    return;
+  }
+  const read = (suffix) => {
+    try {
+      return fs.readFileSync(`${gwRoot}/${suffix}`, "utf8").trim().replace(/\n/gu, "|");
+    } catch (error) {
+      return `unreadable(${error.code ?? "error"})`;
+    }
+  };
+  console.log(`PROOF delegation subtree_control=${read("cgroup.subtree_control")}`);
+  console.log(`PROOF delegation controllers=${read("cgroup.controllers")}`);
+  console.log(`PROOF delegation service procs=${read("cgroup.procs") || "empty"}`);
+  console.log(`PROOF delegation agent-exec memory.high=${read("agent-exec/memory.high")}`);
+  console.log(`PROOF delegation agent-exec subtree_control=${read("agent-exec/cgroup.subtree_control")}`);
+  console.log(`PROOF delegation agent-exec procs=${read("agent-exec/cgroup.procs") || "empty"}`);
+}
+
+/** The Gateway node process: only one matching pid sits in the gateway leaf. */
+function gatewayPid() {  for (const entry of fs.readdirSync("/proc")) {
     if (!/^\d+$/u.test(entry)) {
       continue;
     }
@@ -176,6 +231,8 @@ async function main() {
     console.log(`PROOF agent round=${round} output tail: ${result.out.slice(-600)}`);
   }
 
+  dumpUnitProcesses();
+
   fs.writeFileSync(process.env.SAMPLER_STOP ?? "/tmp/proof-sampler.stop", "stop\n");
   const samplerExit = await new Promise((resolve) => {
     if (sampler.exitCode !== null) {
@@ -208,20 +265,20 @@ async function main() {
   const kinds = { capture: [], validation: [], exec: [] };
   for (const record of records) {
     const cmd = record.cmd ?? "";
-    if (!cmd.includes("shell-snapshots/") && !cmd.includes("snapshot.out")) {
+    if (!short(record.cg).includes(UNIT)) {
       continue;
     }
     if (cmd.includes("PROOF_EXEC_")) {
       kinds.exec.push(record);
+    } else if (cmd.includes("__OPENCLAW_SHELL_SNAPSHOT_CAPTURE__")) {
+      kinds.capture.push(record);
     } else if (cmd.includes(".tmp")) {
       kinds.validation.push(record);
-    } else if (cmd.includes("snapshot.out")) {
-      kinds.capture.push(record);
     }
   }
   for (const kind of ["capture", "validation", "exec"]) {
     for (const record of kinds[kind]) {
-      console.log(`PROOF ${kind} pid=${record.pid} cgroup=${short(record.cg)} cmd=${(record.cmd ?? "").slice(0, 110)}`);
+      console.log(`PROOF ${kind} pid=${record.pid} ppid=${record.ppid} cgroup=${short(record.cg)} cmd=${(record.cmd ?? "").slice(0, 90)}`);
     }
   }
   try {

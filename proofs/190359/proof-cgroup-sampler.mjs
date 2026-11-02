@@ -24,7 +24,7 @@ if (!out || !ready || !stop) {
 //   snapshot.out     -> the interactive capture shell
 //   PROOF_CONTROL    -> the Gateway-internal control
 //   PROOF_EXEC       -> the exec shell the Gateway runs for the requested command
-const MATCH = /shell-snapshots\/|snapshot\.out|PROOF_CONTROL|PROOF_EXEC_/;
+const MATCH = /shell-snapshots\/|__OPENCLAW_SHELL_SNAPSHOT_CAPTURE__|PROOF_CONTROL|PROOF_EXEC_|spawn-broker/;
 const MAX_MISSES = 1_000_000;
 
 fs.writeFileSync(out, "");
@@ -80,9 +80,15 @@ while (Date.now() < deadline) {
     } catch {
       cg = null;
     }
+    let ppid = null;
+    try {
+      ppid = Number(/^PPid:\s+(\d+)$/mu.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1]);
+    } catch {
+      ppid = null;
+    }
     fs.appendFileSync(
       out,
-      `${JSON.stringify({ pid, cg, cmd: cmd.slice(0, 400), atMs: Date.now() - started })}\n`,
+      `${JSON.stringify({ pid, ppid, cg, cmd: cmd.slice(0, 400), atMs: Date.now() - started })}\n`,
     );
     recorded += 1;
   }

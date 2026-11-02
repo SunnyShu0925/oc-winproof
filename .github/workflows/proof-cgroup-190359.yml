@@ -35,6 +35,12 @@ jobs:
           path: oc-winproof
           fetch-depth: 1
 
+      - name: Record the proof head
+        run: |
+          echo "openclaw head: $(git -C openclaw rev-parse HEAD)"
+          git -C openclaw log --oneline -2
+          grep -n 'agent-tool' openclaw/src/agents/shell-snapshot.ts
+
       - name: Copy proof scripts into openclaw tree
         run: |
           mkdir -p openclaw/proofs/190359
