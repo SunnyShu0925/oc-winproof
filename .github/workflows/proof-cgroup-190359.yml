@@ -169,7 +169,12 @@ jobs:
           echo "=== gateway log tail ==="
           tail -40 /tmp/oc-gw.log || true
           systemctl --user stop oc-proof-gw || true
-          grep -c "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log" || true
+          # The step fails unless the proof itself passed; a crashed driver and a
+          # failed verdict both end up here.
+          grep -Fq "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log" || {
+            echo "post-fix proof did not report PASS"
+            exit 1
+          }
 
       - name: Run pre-fix control (main's shell-snapshot.ts)
         if: ${{ github.event.inputs.pre_fix == 'true' }}
@@ -229,6 +234,12 @@ jobs:
           node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
           tail -40 /tmp/oc-gw-pre.log || true
           systemctl --user stop oc-proof-gw-pre || true
+          # The control must fail on placement; a PASS here means the proof cannot
+          # distinguish the fix from main.
+          grep -Fq "PROOF VERDICT: FAIL" "$RUNNER_TEMP/prefix.log" || {
+            echo "control run did not report FAIL"
+            exit 1
+          }
 
       - name: Upload proof logs
         if: always()
