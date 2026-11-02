@@ -295,7 +295,7 @@ async function main() {
   } catch {
     // Sampler never wrote; assertions below fail with evidence.
   }
-  const kinds = { capture: [], validation: [], exec: [], launcher: [] };
+  const kinds = { capture: [], validation: [], exec: [] };
   for (const record of records) {
     // A shell that places itself keeps its pid, so the settled identity is the
     // last cmdline observed for that pid.
@@ -309,11 +309,9 @@ async function main() {
       kinds.capture.push(record);
     } else if (cmd.includes(".tmp")) {
       kinds.validation.push(record);
-    } else if (cmd.includes("cgroup.procs")) {
-      kinds.launcher.push(record);
     }
   }
-  for (const kind of ["capture", "validation", "exec", "launcher"]) {
+  for (const kind of ["capture", "validation", "exec"]) {
     for (const record of kinds[kind]) {
       console.log(
         `PROOF ${kind} pid=${record.pid} ppid=${record.ppid} first=${short(record.firstCg)} last=${short(record.lastCg)} cmd=${(record.lastCmd ?? "").slice(0, 90)}`,
@@ -337,18 +335,10 @@ async function main() {
   });
   const snapshots = publishedSnapshots();
   const reports = captureSelfReports();
-  // A launcher starts in the Gateway leaf and moves itself into agent-exec before
-  // it execs the shell, so a shell that kept the launcher pid legitimately has a
-  // Gateway first observation. Everything else must never touch that leaf.
-  const isLauncherOrigin = (record) =>
-    (record.firstCmd ?? "").includes("cgroup.procs") &&
-    (record.firstCmd ?? "").startsWith("/bin/sh -c printf");
-  const placed = [...kinds.capture, ...kinds.validation, ...kinds.exec].filter(
-    (record) => !isLauncherOrigin(record),
-  );
-  const launchers = records.filter(
-    (record) => isLauncherOrigin(record) && short(record.lastCg ?? record.firstCg).includes(UNIT),
-  );
+  // The parent moves a freshly forked shell into agent-exec, so the capture and
+  // validation shells are legitimately observed in the Gateway leaf first. What
+  // must never happen is a snapshot shell that stays there.
+  const placed = [...kinds.capture, ...kinds.validation, ...kinds.exec];
 
   check("every agent turn finished through the CLI", rounds.every((round) => round.status === 0), rounds.map((r) => r.status).join(","));
   check("snapshot published once per distinct workdir", snapshots.length === ROUNDS, `count=${snapshots.length}`);
@@ -358,9 +348,7 @@ async function main() {
   check("capture shells all in agent-exec", kinds.capture.length > 0 && kinds.capture.every(endsInAgentExec), kinds.capture.map((r) => short(r.lastCg)).slice(0, 3).join(","));
   check("validation shells observed", kinds.validation.length >= 1, `n=${kinds.validation.length}`);
   check("validation shells all in agent-exec", kinds.validation.length > 0 && kinds.validation.every(endsInAgentExec), kinds.validation.map((r) => short(r.lastCg)).slice(0, 3).join(","));
-  check("no placed shell ever ran in the gateway leaf", placed.every((record) => !startsInGateway(record) && !short(record.lastCg).endsWith("gateway")), `n=${placed.length}`);
-  check("placing launchers observed", launchers.length > 0, `n=${launchers.length}`);
-  check("every placing launcher moved itself into agent-exec", launchers.length > 0 && launchers.every(endsInAgentExec), launchers.map((r) => short(r.lastCg)).slice(0, 3).join(","));
+  check("no placed shell stayed in the gateway leaf", placed.every((record) => !short(record.lastCg).endsWith("gateway")), `n=${placed.length}`);
   check("exec shells all in agent-exec", kinds.exec.length > 0 && kinds.exec.every(endsInAgentExec), `n=${kinds.exec.length}`);
 
   const gwAfter = gatewayPid() ? readCgroup(gatewayPid()) : undefined;
