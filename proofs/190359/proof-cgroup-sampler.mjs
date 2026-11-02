@@ -23,7 +23,8 @@ if (!out || !ready || !stop) {
 //   shell-snapshots  -> validation (.tmp) and exec (.sh) shells
 //   snapshot.out     -> the interactive capture shell
 //   PROOF_CONTROL    -> the Gateway-internal control
-const MATCH = /shell-snapshots\/|snapshot\.out|PROOF_CONTROL/;
+//   PROOF_EXEC       -> the exec shell the Gateway runs for the requested command
+const MATCH = /shell-snapshots\/|snapshot\.out|PROOF_CONTROL|PROOF_EXEC_/;
 const MAX_MISSES = 1_000_000;
 
 fs.writeFileSync(out, "");

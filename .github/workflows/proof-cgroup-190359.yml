@@ -1,8 +1,8 @@
 name: Cgroup placement proof (PR 190359)
 
 # Real-behavior proof that shell snapshot capture/validation subprocesses land
-# in the agent-exec cgroup (post-fix) vs the gateway cgroup (pre-fix) on an
-# isolated Linux runner with delegated cgroup v2 + spawn broker enabled.
+# in agent-exec (post-fix) vs the gateway cgroup (pre-fix), driven end to end
+# through a real `openclaw gateway run` process and the shipped CLI.
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +10,16 @@ on:
         description: "PR branch on SunnyShu0925/openclaw"
         required: false
         default: "fix/shell-snapshot-exec-intent-277"
+      pre_fix:
+        description: "Also run the pre-fix control (rebuild with main's shell-snapshot.ts)"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   proof:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout openclaw PR branch
         uses: actions/checkout@v4
@@ -30,10 +35,10 @@ jobs:
           path: oc-winproof
           fetch-depth: 1
 
-      - name: Copy proof script into openclaw tree
+      - name: Copy proof scripts into openclaw tree
         run: |
           mkdir -p openclaw/proofs/190359
-          cp oc-winproof/proofs/190359/proof-snapshot-cgroup.mjs openclaw/proofs/190359/
+          cp oc-winproof/proofs/190359/proof-gateway-exec.mjs openclaw/proofs/190359/
           cp oc-winproof/proofs/190359/proof-cgroup-sampler.mjs openclaw/proofs/190359/
 
       - name: Setup Node.js
@@ -48,77 +53,118 @@ jobs:
         working-directory: openclaw
         run: pnpm install --frozen-lockfile
 
-      - name: Verify source tree loads (no dist build needed; broker worker runs from source via tsx)
+      - name: Build the shipped CLI
         working-directory: openclaw
-        run: node --import tsx/esm -e "import('./src/agents/shell-snapshot.js').then(m=>console.log('snapshot module keys:', Object.keys(m).length))"
+        timeout-minutes: 15
+        run: pnpm openclaw --version
 
       - name: Setup cgroup v2 delegation
         run: |
           set -x
           sudo loginctl enable-linger "$USER"
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          # Propagate io from user.slice down to user@1001.service and app.slice
-          # so the delegated service subtree sees cpu+io+memory controllers.
           sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/cgroup.subtree_control' 2>&1 || true
           sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/cgroup.subtree_control' 2>&1 || true
           sudo bash -c 'echo "+io +cpu +memory" > /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.subtree_control' 2>&1 || true
           USERSVC="/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service"
           sudo bash -c "echo '+io +cpu +memory' > '$USERSVC/app.slice/cgroup.subtree_control'" 2>&1 || true
-          echo "app.slice controllers: $(cat $USERSVC/app.slice/cgroup.controllers)"
+          echo "app.slice controllers: $(cat $USERSVC/app.slice/cgroup.subtree_control)"
 
-      - name: Run post-fix proof (PR head)
-        timeout-minutes: 8
+      - name: Run post-fix proof through a real Gateway (PR head)
+        timeout-minutes: 12
         run: |
           set -x
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-proof-state"
-          export HOME="$RUNNER_TEMP/oc-proof-home"
-          mkdir -p "$OPENCLAW_STATE_DIR" "$HOME"
-          chmod 700 "$OPENCLAW_STATE_DIR" "$HOME"
-          export PROOF_LOG="$RUNNER_TEMP/proof-postfix.log"
-          # Run inside a delegated transient unit so the process lands in
-          # <service>/gateway leaf (matches resolveGatewayServiceCgroupDirectory).
-          # --wait blocks until the unit finishes so we capture the full proof log.
-          systemd-run --user --wait --unit=oc-proof-postfix \
+          export HOME="$RUNNER_TEMP/oc-gw-home"
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state"
+          export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config.json"
+          export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
+          chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
+          cat > "$HOME/.bashrc" <<'BASHRC'
+          # Exists only in this file, so printing it proves a published snapshot was sourced.
+          proof_snapshot_marker() { printf 'SNAPSHOT-WAS-SOURCED\n'; }
+          for i in $(seq 1 500); do alias proof_alias_$i='true'; done
+          sleep 0.3
+          BASHRC
+          cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
+          { "tools": { "exec": { "mode": "full", "host": "gateway" } } }
+          CFG
+          systemd-run --user --unit=oc-proof-gw \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
             --working-directory="$GITHUB_WORKSPACE/openclaw" \
-            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
             --setenv=HOME="$HOME" \
-            --setenv=PROOF_LOG="$PROOF_LOG" \
-            --setenv=PATH="$PATH" \
-            --setenv=SHELL=/bin/bash \
-            bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
-            2>&1 | tee "$RUNNER_TEMP/postfix-stdout.log" || true
-          echo "=== post-fix proof log ==="
-          cat "$PROOF_LOG" || true
+            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
+            --setenv=OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_PATH" \
+            --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+            --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
+            bash -c 'pnpm openclaw gateway run --port 18787 --auth token > /tmp/oc-gw.log 2>&1'
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:18787/readyz > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18787/readyz && echo "gateway ready"
+          systemctl --user show -p MainPID --value oc-proof-gw
+          SAMPLER_OUT="$RUNNER_TEMP/proof-sampler.jsonl" \
+          SAMPLER_READY="$RUNNER_TEMP/proof-sampler.ready" \
+          SAMPLER_STOP="$RUNNER_TEMP/proof-sampler.stop" \
+          PROOF_HTTP="http://127.0.0.1:18787" \
+          PROOF_WS="ws://127.0.0.1:18787" \
+          PROOF_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+          PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
+          PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
+          PROOF_UNIT="oc-proof-gw" \
+          node proofs/190359/proof-gateway-exec.mjs 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
+          echo "=== gateway log tail ==="
+          tail -60 /tmp/oc-gw.log || true
+          systemctl --user stop oc-proof-gw || true
+          grep -c "PROOF VERDICT: PASS" "$RUNNER_TEMP/postfix.log"
 
-      - name: Run pre-fix proof (main, revert the one-line fix)
-        timeout-minutes: 8
+      - name: Run pre-fix control (main's shell-snapshot.ts)
+        if: ${{ github.event.inputs.pre_fix == 'true' }}
+        timeout-minutes: 15
         run: |
           set -x
           cd openclaw
-          # Revert the fix: fetch main and check out its shell-snapshot.ts.
-          git fetch origin main 2>&1 || true
-          git checkout origin/main -- src/agents/shell-snapshot.ts 2>&1 || true
-          git diff --stat 2>&1 || true
+          git fetch origin main
+          git checkout origin/main -- src/agents/shell-snapshot.ts
+          git diff --stat
+          cd ..
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-proof-state-pre"
-          export HOME="$RUNNER_TEMP/oc-proof-home-pre"
-          mkdir -p "$OPENCLAW_STATE_DIR" "$HOME"
-          chmod 700 "$OPENCLAW_STATE_DIR" "$HOME"
-          export PROOF_LOG="$RUNNER_TEMP/proof-prefix.log"
-          systemd-run --user --wait --unit=oc-proof-prefix \
+          export HOME="$RUNNER_TEMP/oc-gw-home-pre"
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state-pre"
+          export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config-pre.json"
+          export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
+          chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
+          cp "$RUNNER_TEMP/oc-gw-home/.bashrc" "$HOME/.bashrc"
+          cp "$RUNNER_TEMP/oc-gw-config.json" "$OPENCLAW_CONFIG_PATH"
+          (cd openclaw && OPENCLAW_FORCE_BUILD=1 pnpm openclaw --version)
+          systemd-run --user --unit=oc-proof-gw-pre \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
             --working-directory="$GITHUB_WORKSPACE/openclaw" \
-            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
             --setenv=HOME="$HOME" \
-            --setenv=PROOF_LOG="$PROOF_LOG" \
-            --setenv=PATH="$PATH" \
-            --setenv=SHELL=/bin/bash \
-            bash -c 'node --import tsx/esm proofs/190359/proof-snapshot-cgroup.mjs; echo "PROOF_EXIT=$?"' \
-            2>&1 | tee "$RUNNER_TEMP/prefix-stdout.log" || true
-          echo "=== pre-fix proof log ==="
-          cat "$PROOF_LOG" || true
+            --setenv=OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" \
+            --setenv=OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_PATH" \
+            --setenv=OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+            --setenv=PATH="$PATH" --setenv=SHELL=/bin/bash \
+            bash -c 'pnpm openclaw gateway run --port 18788 --auth token > /tmp/oc-gw-pre.log 2>&1'
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:18788/readyz > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          SAMPLER_OUT="$RUNNER_TEMP/proof-sampler-pre.jsonl" \
+          SAMPLER_READY="$RUNNER_TEMP/proof-sampler-pre.ready" \
+          SAMPLER_STOP="$RUNNER_TEMP/proof-sampler-pre.stop" \
+          PROOF_HTTP="http://127.0.0.1:18788" \
+          PROOF_WS="ws://127.0.0.1:18788" \
+          PROOF_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+          PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
+          PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
+          PROOF_UNIT="oc-proof-gw-pre" \
+          node openclaw/proofs/190359/proof-gateway-exec.mjs 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
+          tail -40 /tmp/oc-gw-pre.log || true
+          systemctl --user stop oc-proof-gw-pre || true
 
       - name: Upload proof logs
         if: always()
@@ -126,6 +172,7 @@ jobs:
         with:
           name: cgroup-proof-logs
           path: |
-            ${{ runner.temp }}/proof-postfix.log
-            ${{ runner.temp }}/proof-prefix.log
-            ${{ runner.temp }}/*-stdout.log
+            ${{ runner.temp }}/postfix.log
+            ${{ runner.temp }}/prefix.log
+            ${{ runner.temp }}/proof-sampler*.jsonl
+            /tmp/oc-gw*.log
