@@ -144,7 +144,7 @@ async function main() {
   // The alias block is a realistic heavy startup file: it makes the snapshot big
   // enough that the validation shell lives long enough to be observed, and
   // placement does not depend on snapshot size.
-  const ALIAS_COUNT = 800;
+  const ALIAS_COUNT = 3000;
   const aliasLines = Array.from(
     { length: ALIAS_COUNT },
     (_, index) => `alias proof_alias_${index}='ls -l'`,
