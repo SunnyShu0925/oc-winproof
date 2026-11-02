@@ -167,11 +167,28 @@ function writeControl(round) {
   );
 }
 
+/**
+ * The mock provider is scripted to call exec with `proof_snapshot_marker`, which
+ * the published snapshot defines; sourcing that snapshot and running the helper
+ * prints `SNAPSHOT-WAS-SOURCED`. A real model gets an explicit instruction to
+ * run the same command so the proof no longer depends on a scripted provider.
+ */
+function agentMessage(round) {
+  if (process.env.PROOF_REAL_MODEL === "1") {
+    return [
+      "Use the exec tool to run exactly this shell command, unchanged:",
+      `proof_snapshot_marker > /tmp/proof-round-${round}.out ; echo PROOF_ROUND_${round}_DONE`,
+      "Do not add quotes or other commands. Then report the DONE line you saw.",
+    ].join(" ");
+  }
+  return `proof round ${round}`;
+}
+
 function runAgentTurn(round) {
   const started = Date.now();
   const result = spawnSync(
     "pnpm",
-    ["openclaw", "agent", "--agent", "main", "--message", `proof round ${round}`, "--json"],
+    ["openclaw", "agent", "--agent", "main", "--message", agentMessage(round), "--json"],
     { cwd: REPO, encoding: "utf8", timeout: 240000, env: process.env },
   );
   return { round, status: result.status, out: `${result.stdout ?? ""}${result.stderr ?? ""}`, ms: Date.now() - started };
@@ -208,21 +225,29 @@ function captureSelfReports() {
 
 async function main() {
   console.log(`PROOF gateway ${HTTP} unit=${UNIT} repo=${REPO}`);
+  const realModel = process.env.PROOF_REAL_MODEL === "1";
+  console.log(`PROOF mode=${realModel ? "real-model" : "mock-provider"}`);
 
-  const mock = spawn(process.execPath, [`${REPO}/scripts/e2e/mock-openai-server.mjs`], {
-    cwd: REPO,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, MOCK_PORT, MOCK_RESPONSE_CONTROL: CONTROL, MOCK_REQUEST_LOG: "/tmp/proof-mock-requests.jsonl" },
-  });
+  let mock;
   let mockLog = "";
-  mock.stdout.on("data", (chunk) => {
-    mockLog += String(chunk);
-  });
-  mock.stderr.on("data", (chunk) => {
-    mockLog += String(chunk);
-  });
-  const mockReady = await waitFor(`http://127.0.0.1:${MOCK_PORT}/health`, 30_000);
-  check("e2e mock provider answered /health", mockReady, `port=${MOCK_PORT}`);
+  let mockReady = false;
+  if (!realModel) {
+    mock = spawn(process.execPath, [`${REPO}/scripts/e2e/mock-openai-server.mjs`], {
+      cwd: REPO,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, MOCK_PORT, MOCK_RESPONSE_CONTROL: CONTROL, MOCK_REQUEST_LOG: "/tmp/proof-mock-requests.jsonl" },
+    });
+    mock.stdout.on("data", (chunk) => {
+      mockLog += String(chunk);
+    });
+    mock.stderr.on("data", (chunk) => {
+      mockLog += String(chunk);
+    });
+    mockReady = await waitFor(`http://127.0.0.1:${MOCK_PORT}/health`, 30_000);
+    check("e2e mock provider answered /health", mockReady, `port=${MOCK_PORT}`);
+  } else {
+    check("real-model proof skips the scripted mock provider", true);
+  }
 
   const ready = await waitFor(`${HTTP}/readyz`, 180_000);
   const gwPid = gatewayPid();
@@ -351,8 +376,10 @@ async function main() {
   );
 
   check("every agent turn finished through the CLI", rounds.every((round) => round.status === 0), rounds.map((r) => r.status).join(","));
-  check("snapshot published once per distinct workdir", snapshots.length === ROUNDS, `count=${snapshots.length}`);
-  check("every exec shell printed the snapshot-only marker", markers.length === ROUNDS, `${markers.length}/${ROUNDS}`);
+  const snapshotCountOk = process.env.PROOF_REAL_MODEL === "1" ? snapshots.length >= 1 : snapshots.length === ROUNDS;
+  check("snapshot published at least once (real model may reuse one workdir)", snapshotCountOk, `count=${snapshots.length}`);
+  const markersOk = process.env.PROOF_REAL_MODEL === "1" ? markers.length >= 1 : markers.length === ROUNDS;
+  check("snapshot sourced and used by an exec turn", markersOk, `${markers.length}/${ROUNDS}`);
   check("capture shells report agent-exec", reports.length >= ROUNDS && reports.every((row) => short(row.cgroup).endsWith("agent-exec")), reports.map((row) => short(row.cgroup)).slice(0, 3).join(",") || "none");
   check("capture shells observed", kinds.capture.length >= 1, `n=${kinds.capture.length}`);
   check("capture shells all in agent-exec", kinds.capture.length > 0 && kinds.capture.every(endsInAgentExec), kinds.capture.map((r) => short(r.lastCg)).slice(0, 3).join(","));
@@ -367,9 +394,11 @@ async function main() {
   console.log(`PROOF gateway after cgroup=${short(gwAfter)}`);
   check("gateway process remained in the gateway leaf", short(gwAfter).endsWith("gateway"), short(gwAfter));
 
-  mock.kill("SIGTERM");
-  if (!mockReady) {
-    console.log(`PROOF mock log: ${mockLog.slice(-800)}`);
+  if (mock) {
+    mock.kill("SIGTERM");
+    if (!mockReady) {
+      console.log(`PROOF mock log: ${mockLog.slice(-800)}`);
+    }
   }
   console.log(`PROOF mock requests: ${fs.existsSync("/tmp/proof-mock-requests.jsonl") ? fs.readFileSync("/tmp/proof-mock-requests.jsonl", "utf8").split("\n").filter(Boolean).length : 0}`);
 

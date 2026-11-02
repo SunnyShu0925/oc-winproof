@@ -15,6 +15,11 @@ on:
         type: boolean
         required: false
         default: false
+      real_model:
+        description: "Use a real provider (PROOF_OPENCLAW_CONFIG + PROOF_API_KEY secrets) instead of the scripted mock provider"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   proof:
@@ -84,6 +89,8 @@ jobs:
 
       - name: Run post-fix proof through a real Gateway agent turn (PR head)
         timeout-minutes: 14
+        env:
+          PROOF_OPENCLAW_CONFIG: ${{ secrets.PROOF_OPENCLAW_CONFIG }}
         run: |
           set -x
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -91,7 +98,6 @@ jobs:
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state"
           export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config.json"
           export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
-          export OPENAI_API_KEY="proof-stub-key"
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           cat > "$HOME/.bashrc" <<'BASHRC'
@@ -102,39 +108,45 @@ jobs:
           for i in $(seq 1 500); do alias proof_alias_$i='true'; done
           sleep 0.3
           BASHRC
-          cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
-          {
-            "gateway": { "mode": "local", "port": 18787 },
-            "models": {
-              "mode": "merge",
-              "providers": {
-                "openai": {
-                  "baseUrl": "http://127.0.0.1:18799/v1",
-                  "api": "openai-completions",
-                  "apiKey": "proof-stub-key",
-                  "agentRuntime": { "id": "openclaw" },
-                  "request": { "allowPrivateNetwork": true },
-                  "models": [
-                    {
-                      "id": "gpt-5.6-luna",
-                      "name": "gpt-5.6-luna",
-                      "api": "openai-completions",
-                      "agentRuntime": { "id": "openclaw" },
-                      "reasoning": false,
-                      "input": ["text"],
-                      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                      "contextWindow": 128000,
-                      "contextTokens": 96000,
-                      "maxTokens": 4096
-                    }
-                  ]
+          if [ "${{ github.event.inputs.real_model }}" = "true" ]; then
+            # Real provider config is supplied as a secret; never echo it.
+            printf '%s' "$PROOF_OPENCLAW_CONFIG" > "$OPENCLAW_CONFIG_PATH"
+          else
+            export OPENAI_API_KEY="proof-stub-key"
+            cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
+            {
+              "gateway": { "mode": "local", "port": 18787 },
+              "models": {
+                "mode": "merge",
+                "providers": {
+                  "openai": {
+                    "baseUrl": "http://127.0.0.1:18799/v1",
+                    "api": "openai-completions",
+                    "apiKey": "proof-stub-key",
+                    "agentRuntime": { "id": "openclaw" },
+                    "request": { "allowPrivateNetwork": true },
+                    "models": [
+                      {
+                        "id": "gpt-5.6-luna",
+                        "name": "gpt-5.6-luna",
+                        "api": "openai-completions",
+                        "agentRuntime": { "id": "openclaw" },
+                        "reasoning": false,
+                        "input": ["text"],
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                        "contextWindow": 128000,
+                        "contextTokens": 96000,
+                        "maxTokens": 4096
+                      }
+                    ]
+                  }
                 }
-              }
-            },
-            "agents": { "defaults": { "model": { "primary": "openai/gpt-5.6-luna" } } },
-            "tools": { "exec": { "mode": "full", "host": "gateway" } }
-          }
-          CFG
+              },
+              "agents": { "defaults": { "model": { "primary": "openai/gpt-5.6-luna" } } },
+              "tools": { "exec": { "mode": "full", "host": "gateway" } }
+            }
+            CFG
+          fi
           systemd-run --user --unit=oc-proof-gw \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
             --working-directory="$GITHUB_WORKSPACE/openclaw" \
@@ -165,6 +177,7 @@ jobs:
           PROOF_REPO="$GITHUB_WORKSPACE/openclaw" \
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw" \
+          PROOF_REAL_MODEL="${{ github.event.inputs.real_model == 'true' && '1' || '' }}" \
           node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/postfix.log" || true
           echo "=== gateway log tail ==="
           tail -40 /tmp/oc-gw.log || true
@@ -179,6 +192,8 @@ jobs:
       - name: Run pre-fix control (main's shell-snapshot.ts)
         if: ${{ github.event.inputs.pre_fix == 'true' }}
         timeout-minutes: 18
+        env:
+          PROOF_OPENCLAW_CONFIG: ${{ secrets.PROOF_OPENCLAW_CONFIG }}
         run: |
           set -x
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -196,12 +211,17 @@ jobs:
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/oc-gw-state-pre"
           export OPENCLAW_CONFIG_PATH="$RUNNER_TEMP/oc-gw-config-pre.json"
           export OPENCLAW_GATEWAY_TOKEN="proof-token-190359"
-          export OPENAI_API_KEY="proof-stub-key"
           mkdir -p "$HOME" "$OPENCLAW_STATE_DIR"
           chmod 700 "$HOME" "$OPENCLAW_STATE_DIR"
           sed 's|/tmp/proof-capture-cgroups.txt|/tmp/proof-capture-cgroups-pre.txt|' \
             "$RUNNER_TEMP/oc-gw-home/.bashrc" > "$HOME/.bashrc"
-          sed -e 's/18799/18798/' -e 's/18787/18788/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
+          if [ "${{ github.event.inputs.real_model }}" = "true" ]; then
+            # Same real config on the control gateway port (18788).
+            sed 's/18787/18788/g' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
+          else
+            export OPENAI_API_KEY="proof-stub-key"
+            sed -e 's/18799/18798/' -e 's/18787/18788/' "$RUNNER_TEMP/oc-gw-config.json" > "$OPENCLAW_CONFIG_PATH"
+          fi
           (cd openclaw && OPENCLAW_FORCE_BUILD=1 pnpm openclaw --version)
           systemd-run --user --unit=oc-proof-gw-pre \
             --property=Delegate=yes --property=DelegateSubgroup=gateway \
@@ -232,6 +252,7 @@ jobs:
           PROOF_STATE_DIR="$OPENCLAW_STATE_DIR" \
           PROOF_UNIT="oc-proof-gw-pre" \
           PROOF_TAG="-pre" \
+          PROOF_REAL_MODEL="${{ github.event.inputs.real_model == 'true' && '1' || '' }}" \
           node "$GITHUB_WORKSPACE/openclaw/proofs/190359/proof-gateway-agent.mjs" 2>&1 | tee "$RUNNER_TEMP/prefix.log" || true
           tail -40 /tmp/oc-gw-pre.log || true
           systemctl --user stop oc-proof-gw-pre || true
@@ -241,6 +262,14 @@ jobs:
             echo "control run did not report FAIL"
             exit 1
           }
+
+      - name: Redact secrets and endpoints from proof logs
+        if: always()
+        env:
+          PROOF_API_KEY: ${{ secrets.PROOF_API_KEY }}
+          LOG_DIR: ${{ runner.temp }}
+        run: |
+          node "$GITHUB_WORKSPACE/oc-winproof/proofs/190359/proof-redact.mjs"
 
       - name: Upload proof logs
         if: always()
