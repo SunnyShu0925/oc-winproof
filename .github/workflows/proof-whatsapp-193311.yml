@@ -1,0 +1,116 @@
+name: WhatsApp group metadata cache elapsed-time proof (PR 193311)
+
+# Shipped-path proof for PR 193311: judge the WhatsApp group metadata cache
+# lifetime on elapsed time instead of wall-clock time.
+#
+# Both arms run the shipped Gateway (source entry) with the bundled WhatsApp
+# channel plugin, the shipped group metadata cache owner, the shipped inbound
+# monitor and outbound send path, and the shipped `openclaw message send` CLI.
+# No paired WhatsApp device is available on a runner, so the single Baileys
+# socket factory call in the channel session module is pointed at a local peer
+# (no WhatsApp network). The peer hydrates the group roster, then swaps the
+# roster WITHOUT emitting a group event, and the Gateway process's wall clock is
+# stepped back 300 s (Date.now only). After 301 s of real elapsed time the proof
+# sends a group mention of the new member through the shipped CLI.
+#
+# post-fix -> cache entry is expired by real elapsed time (301 s > 300 s TTL),
+#             the roster is refetched and the mention resolves
+# pre-fix  -> the stepped wall clock (1 s at the probe) keeps the entry fresh,
+#             the stale roster is served and the mention stays plain text
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: "PR branch on SunnyShu0925/openclaw"
+        required: false
+        default: "fix/whatsapp-group-metadata-cache-elapsed-time-297"
+      wait_ms:
+        description: "Real elapsed wait between hydration and the cache probe (ms)"
+        required: false
+        default: "301000"
+      step_back_ms:
+        description: "Wall-clock step back size (ms), Date.now only"
+        required: false
+        default: "300000"
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [post-fix, pre-fix]
+    name: ${{ matrix.variant }}
+    steps:
+      - name: Checkout openclaw PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ github.event.inputs.pr_branch }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          path: oc-winproof
+          fetch-depth: 1
+
+      - name: Copy proof scripts into openclaw tree
+        working-directory: openclaw
+        run: |
+          mkdir -p proofs/193311
+          cp ../oc-winproof/proofs/193311/* proofs/193311/
+          chmod +x proofs/193311/run-proof.sh
+          ls -l proofs/193311
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        working-directory: openclaw
+        run: pnpm install --frozen-lockfile
+
+      - name: Revert both cache files to the base wall-clock reads (pre-fix variant)
+        if: matrix.variant == 'pre-fix'
+        working-directory: openclaw
+        run: |
+          git fetch --depth=1 origin main
+          git checkout FETCH_HEAD -- \
+            extensions/whatsapp/src/inbound/baileys-cache.ts \
+            extensions/whatsapp/src/inbound/group-metadata-cache.ts
+          git diff --stat
+          echo "--- clock reads after revert:"
+          grep -nE "Date\.now\(\)|performance\.now\(\)" \
+            extensions/whatsapp/src/inbound/baileys-cache.ts \
+            extensions/whatsapp/src/inbound/group-metadata-cache.ts
+
+      - name: Show PR head and shipped CLI
+        working-directory: openclaw
+        run: |
+          git rev-parse HEAD
+          node --import tsx/esm src/entry.ts --version
+
+      - name: Run shipped-Gateway elapsed-time proof
+        working-directory: openclaw
+        env:
+          PROOF_VARIANT: ${{ matrix.variant }}
+          PROOF_WAIT_MS: ${{ github.event.inputs.wait_ms }}
+          PROOF_STEP_MS: ${{ github.event.inputs.step_back_ms }}
+        run: bash proofs/193311/run-proof.sh
+
+      - name: Upload proof transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-193311-${{ matrix.variant }}
+          path: |
+            openclaw/proofs/193311/out-${{ matrix.variant }}/gateway.log
+            openclaw/proofs/193311/out-${{ matrix.variant }}/send.log*
+          if-no-files-found: ignore
