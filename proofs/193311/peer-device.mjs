@@ -123,8 +123,12 @@ export async function makePeerDevice({ meJid, log }) {
       );
       const deliveredEnc = (toNode?.content ?? []).filter((child) => child?.tag === "enc");
       const groupEnc = content.filter((child) => child?.tag === "enc");
-      if (!deliveredEnc.length) {
-        return { ok: false, reason: `no enc node addressed to ${meJid}` };
+      // A device that already holds the group sender key receives only the group
+      // skmsg; WhatsApp stops fanning out a pkmsg per device once the sender key
+      // is distributed, so an skmsg alone is a complete delivery.
+      const hasGroupSenderKey = groupEnc.some((child) => child?.attrs?.type === "skmsg");
+      if (!deliveredEnc.length && !hasGroupSenderKey) {
+        return { ok: false, reason: `no enc node addressed to ${meJid} and no group sender key message` };
       }
       const delivered = {
         tag: "message",
