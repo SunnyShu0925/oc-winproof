@@ -81,7 +81,8 @@ jobs:
         if: matrix.variant == 'pre-fix'
         working-directory: openclaw
         run: |
-          git fetch --depth=1 origin main
+          git remote add upstream https://github.com/openclaw/openclaw || true
+          git fetch --depth=1 upstream main
           git checkout FETCH_HEAD -- \
             extensions/whatsapp/src/inbound/baileys-cache.ts \
             extensions/whatsapp/src/inbound/group-metadata-cache.ts
