@@ -3,12 +3,16 @@
 // real WhatsApp credentials are used: key material is generated locally.
 import fs from "node:fs";
 import path from "node:path";
-import { BufferJSON, initAuthCreds } from "baileys";
+import { pathToFileURL } from "node:url";
 
 const authDir = process.argv[2];
 if (!authDir) {
   throw new Error("usage: write-creds.mjs <authDir>");
 }
+const ROOT = process.env.PROOF_REPO_ROOT ?? process.cwd();
+const { BufferJSON, initAuthCreds } = await import(
+  pathToFileURL(path.join(ROOT, "node_modules/baileys/lib/index.js")).href
+);
 const selfJid = process.env.PROOF_SELF_JID ?? "15550000001@s.whatsapp.net";
 
 const creds = initAuthCreds();

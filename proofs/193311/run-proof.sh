@@ -1,46 +1,139 @@
 #!/usr/bin/env bash
-# Shipped-path proof for PR 193311: a process-local wall-clock step must not
-# extend the WhatsApp group metadata cache lifetime, and a later group send must
-# resolve a refreshed participant mention.
+# Shipped-path proof for PR 193311.
 #
-# Runs the shipped Gateway (source entry) and the shipped `message send` CLI with
-# the bundled WhatsApp channel plugin. Only the WhatsApp Web socket is local
-# (no paired device available); the group metadata cache owners, inbound monitor,
-# and outbound send path are the shipped ones. Only Date.now() is stepped.
+# A running Gateway keeps a WhatsApp group-metadata cache entry. A wall-clock
+# step backwards (NTP correction / VM resume) must not extend that entry's
+# lifetime: the next group send has to re-read the participant list over the
+# real transport and deliver the mention of a member who joined after the
+# cached snapshot.
+#
+# Everything below is shipped code: the Gateway source entry, the bundled
+# WhatsApp channel plugin (session, inbound monitor, cache owner, outbound send
+# path) and the `message send` CLI. The only local stand-ins are:
+#   * the WhatsApp Web endpoint, injected through the shipped
+#     OPENCLAW_WHATSAPP_WEB_SOCKET_URL override, speaking the real Baileys
+#     WebSocket + Noise protocol (wa-peer.mjs);
+#   * a second real Signal device inside that peer (peer-device.mjs), which
+#     decrypts the group stanza the client actually encrypted and reports the
+#     mention list it received;
+#   * a task-owned Noise trust anchor, because the shipped client pins
+#     WhatsApp's long-term certificate key (anchor-trust.mjs restores it).
+# Only Date.now() is stepped; performance.now() keeps running.
+#
+# variants: PROOF_VARIANT=fixed (branch) | reverted (both cache files at origin/main)
 set -euo pipefail
 
 VARIANT="${PROOF_VARIANT:-fixed}"
 ROOT="${PROOF_REPO_ROOT:-$(pwd)}"
 PROOF_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROOF_DIR="${PROOF_DIR:-$ROOT/proofs/193311/out-$VARIANT}"
+PROOF_DIR="${PROOF_DIR:-$PROOF_SRC/out-$VARIANT}"
 GROUP_JID="${PROOF_GROUP_JID:-120363000000000001@g.us}"
 SELF_JID="${PROOF_SELF_JID:-15550000001@s.whatsapp.net}"
+MENTION_JID="${PROOF_NEW_MEMBER_JID:-15550000333@s.whatsapp.net}"
 WAIT_MS="${PROOF_WAIT_MS:-301000}"
 STEP_MS="${PROOF_STEP_MS:-60000}"
-PORT="${PROOF_GATEWAY_PORT:-$((39000 + RANDOM % 900))}"
-PROOF_ENTRY="${PROOF_ENTRY:-source}"
+GATEWAY_PORT="${PROOF_GATEWAY_PORT:-$((39000 + RANDOM % 900))}"
+BASE_REF="${PROOF_BASE_REF:-origin/main}"
+CACHE_FILES=(
+  extensions/whatsapp/src/inbound/baileys-cache.ts
+  extensions/whatsapp/src/inbound/group-metadata-cache.ts
+)
 
 STATE_DIR="$PROOF_DIR/state"
 AUTH_DIR="$PROOF_DIR/wa-auth"
 CONFIG_PATH="$STATE_DIR/openclaw.json"
 GATEWAY_LOG="$PROOF_DIR/gateway.log"
+PEER_LOG="$PROOF_DIR/peer.log"
 SEND_LOG="$PROOF_DIR/send.log"
+ANCHOR_FILE="$PROOF_DIR/anchor.json"
+PEER_PORT_FILE="$PROOF_DIR/peer-port"
+CLOCK_STEP_FILE="$PROOF_DIR/clock-step"
+ROSTER_SWAP_FILE="$PROOF_DIR/roster-swap"
+
+cleanup() {
+  if [[ -n "${GATEWAY_PID:-}" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
+    kill "$GATEWAY_PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$GATEWAY_PID" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$GATEWAY_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${PEER_PID:-}" ]] && kill -0 "$PEER_PID" 2>/dev/null; then
+    kill "$PEER_PID" 2>/dev/null || true
+  fi
+  if [[ "$VARIANT" == "reverted" ]]; then
+    ( cd "$ROOT" && git checkout -- "${CACHE_FILES[@]}" ) || true
+  fi
+  ( cd "$ROOT" && PROOF_REPO_ROOT="$ROOT" node "$PROOF_SRC/anchor-trust.mjs" restore ) || true
+}
 
 rm -rf "$PROOF_DIR"
-mkdir -p "$STATE_DIR" "$PROOF_DIR"
+mkdir -p "$STATE_DIR"
 chmod 700 "$PROOF_DIR" "$STATE_DIR"
+
+# The loopback peer must be reached directly; this sandbox exports an HTTP proxy
+# that the channel's websocket agent would otherwise tunnel through.
+for proxy_var in http_proxy https_proxy all_proxy ftp_proxy \
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY FTP_PROXY NODE_USE_ENV_PROXY; do
+  unset "$proxy_var" || true
+done
 
 export OPENCLAW_STATE_DIR="$STATE_DIR"
 export OPENCLAW_CONFIG_PATH="$CONFIG_PATH"
-export PROOF_REPO_ROOT="$ROOT"
-export PROOF_DIR PROOF_GROUP_JID="$GROUP_JID" PROOF_SELF_JID="$SELF_JID" PROOF_WAIT_MS="$WAIT_MS" PROOF_STEP_MS="$STEP_MS"
 export OPENCLAW_DISABLE_TELEMETRY=1
-# Local loopback gateway auth: the shipped CLI authenticates with the same env token.
 export OPENCLAW_GATEWAY_TOKEN="proof-local-token"
+export PROOF_REPO_ROOT="$ROOT"
+export PROOF_GROUP_JID="$GROUP_JID" PROOF_SELF_JID="$SELF_JID"
+
+trap cleanup EXIT
+
+cd "$ROOT"
+
+if [[ "$VARIANT" == "reverted" ]]; then
+  echo "PROOF arm=reverted: restoring both cache files from $BASE_REF before the run"
+  for file in "${CACHE_FILES[@]}"; do
+    git show "$BASE_REF:$file" >"$file"
+  done
+fi
+
+echo "PROOF variant=$VARIANT node=$(node -v) repo=$ROOT"
+echo "PROOF state=$STATE_DIR gatewayPort=$GATEWAY_PORT group=$GROUP_JID waitMs=$WAIT_MS stepBackMs=$STEP_MS"
+echo "PROOF clock reads in the two cache files under test:"
+grep -nE "Date\.now\(\)|performance\.now\(\)" "${CACHE_FILES[@]}" || true
+if [[ "$VARIANT" == "reverted" ]]; then
+  echo "PROOF working-tree diff for the two cache files (arm reverted to $BASE_REF):"
+  git diff --stat -- "${CACHE_FILES[@]}" || true
+fi
+
+node "$PROOF_SRC/write-creds.mjs" "$AUTH_DIR"
+PROOF_REPO_ROOT="$ROOT" node "$PROOF_SRC/anchor-trust.mjs" generate "$ANCHOR_FILE"
+PROOF_REPO_ROOT="$ROOT" node "$PROOF_SRC/anchor-trust.mjs" apply "$ANCHOR_FILE"
+
+echo "PROOF starting local WhatsApp Web protocol peer"
+PROOF_REPO_ROOT="$ROOT" \
+  PROOF_PEER_PORT_FILE="$PEER_PORT_FILE" \
+  PROOF_ROSTER_SWAP_FILE="$ROSTER_SWAP_FILE" \
+  PROOF_ANCHOR_FILE="$ANCHOR_FILE" \
+  node "$PROOF_SRC/wa-peer.mjs" >"$PEER_LOG" 2>&1 &
+PEER_PID=$!
+
+for _ in $(seq 1 100); do
+  [[ -f "$PEER_PORT_FILE" ]] && break
+  sleep 0.1
+done
+if [[ ! -f "$PEER_PORT_FILE" ]]; then
+  echo "PROOF peer did not report a port; log:"
+  cat "$PEER_LOG" || true
+  exit 1
+fi
+PEER_PORT="$(cat "$PEER_PORT_FILE")"
+PEER_URL="ws://127.0.0.1:$PEER_PORT/ws/chat"
+echo "PROOF peer pid=$PEER_PID url=$PEER_URL"
 
 cat >"$CONFIG_PATH" <<JSON
 {
-  "gateway": { "mode": "local", "bind": "loopback", "port": $PORT, "auth": { "mode": "token" } },
+  "gateway": { "mode": "local", "bind": "loopback", "port": $GATEWAY_PORT, "auth": { "mode": "token" } },
   "channels": {
     "whatsapp": {
       "enabled": true,
@@ -52,107 +145,94 @@ cat >"$CONFIG_PATH" <<JSON
 JSON
 chmod 600 "$CONFIG_PATH"
 
-if [[ "$PROOF_ENTRY" == "dist" ]]; then
-  CLI_CMD=(node openclaw.mjs)
-  GW_CMD=(node --import "$PROOF_SRC/preload-clock.mjs" --import "$PROOF_SRC/preload-socket.mjs" openclaw.mjs)
-else
-  CLI_CMD=(node --import tsx/esm src/entry.ts)
-  GW_CMD=(node --import tsx/esm --import "$PROOF_SRC/preload-clock.mjs" --import "$PROOF_SRC/preload-socket.mjs" src/entry.ts)
-fi
+CLI_CMD=(node --import tsx/esm src/entry.ts)
+GW_CMD=(node --import tsx/esm --import "$PROOF_SRC/preload-clock.mjs" src/entry.ts)
 
-echo "PROOF variant=$VARIANT node=$(node -v) repo=$ROOT entry=$PROOF_ENTRY"
-echo "PROOF cli=$("${CLI_CMD[@]}" --version 2>&1 | head -1)"
-echo "PROOF state=$STATE_DIR port=$PORT group=$GROUP_JID waitMs=$WAIT_MS stepBackMs=$STEP_MS"
-
-# No paired WhatsApp device is available on the runner, so the single Baileys
-# socket factory call in the channel's session module is pointed at the local
-# peer. The two cache files under test are untouched.
-sed -i 's/const sock = makeWASocket({/const sock = globalThis.__proofMakeWASocket({/' extensions/whatsapp/src/session.ts
-echo "PROOF clock reads in the two cache files under test:"
-grep -nE "Date\.now\(\)|performance\.now\(\)" \
-  extensions/whatsapp/src/inbound/baileys-cache.ts \
-  extensions/whatsapp/src/inbound/group-metadata-cache.ts || true
-echo "PROOF socket factory call site after patch:"
-grep -n "__proofMakeWASocket" extensions/whatsapp/src/session.ts || true
-echo "PROOF patched diff (socket factory only):"
-git diff -U0 -- extensions/whatsapp/src/session.ts | grep -E "^[+-][^+-]" || true
-
-node "$PROOF_SRC/write-creds.mjs" "$AUTH_DIR"
-
-GATEWAY_PID=""
-cleanup() {
-  if [[ -n "$GATEWAY_PID" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    kill "$GATEWAY_PID" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      kill -0 "$GATEWAY_PID" 2>/dev/null || break
-      sleep 0.5
-    done
-    kill -9 "$GATEWAY_PID" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT
-
-echo "PROOF starting shipped Gateway: ${GW_CMD[*]} gateway run --port $PORT"
-"${GW_CMD[@]}" gateway run --port "$PORT" --allow-unconfigured --verbose \
+echo "PROOF starting shipped Gateway: ${GW_CMD[*]} gateway run --port $GATEWAY_PORT"
+OPENCLAW_WHATSAPP_WEB_SOCKET_URL="$PEER_URL" \
+  PROOF_CLOCK_STEP_FILE="$CLOCK_STEP_FILE" \
+  PROOF_STEP_MS="$STEP_MS" \
+  "${GW_CMD[@]}" gateway run --port "$GATEWAY_PORT" --allow-unconfigured --verbose \
   >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 echo "PROOF gateway pid=$GATEWAY_PID"
 
-deadline=$((SECONDS + 600))
-while [[ ! -f "$PROOF_DIR/send-ready" ]]; do
+deadline=$((SECONDS + 420))
+while true; do
+  if grep -q "group roster served" "$PEER_LOG"; then
+    break
+  fi
   if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    echo "PROOF gateway exited before probe; tail:"
-    tail -n 60 "$GATEWAY_LOG" || true
+    echo "PROOF gateway exited before the channel hydrated; tail:"
+    tail -n 80 "$GATEWAY_LOG" || true
     exit 1
   fi
   if (( SECONDS > deadline )); then
-    echo "PROOF timed out waiting for cache probe; tail:"
+    echo "PROOF timed out waiting for channel hydration; gateway tail:"
     tail -n 80 "$GATEWAY_LOG" || true
     exit 1
   fi
   sleep 2
 done
+echo "PROOF channel hydrated over the real transport:"
+grep -E "group roster served|group metadata served|noise handshake complete|success node sent" "$PEER_LOG" | tail -n 5
 
-echo "PROOF probe reached; running shipped CLI send"
+echo "PROOF waiting ${WAIT_MS}ms of real elapsed time (cache TTL is 300000ms)"
+sleep "$((WAIT_MS / 1000))"
 
-send_once() {
-  local attempt="$1"
-  set +e
-  "${CLI_CMD[@]}" message send \
-    --channel whatsapp \
-    --target "$GROUP_JID" \
-    --message "handoff ping @15550000333" \
-    --json >"$SEND_LOG.$attempt" 2>&1
-  local status=$?
-  set -e
-  echo "PROOF message send attempt=$attempt exit=$status"
-  cat "$SEND_LOG.$attempt"
+echo "PROOF stepping the Gateway wall clock back ${STEP_MS}ms (Date.now only)"
+: >"$CLOCK_STEP_FILE"
+sleep 1
+grep -E "^PROOF clock step back" "$GATEWAY_LOG" || {
+  echo "PROOF clock step was not observed; gateway tail:"
+  tail -n 40 "$GATEWAY_LOG" || true
+  exit 1
 }
 
-wait_for_socket_send() {
-  local i
-  for i in $(seq 1 60); do
-    if grep -q "fixture socket.sendMessage" "$GATEWAY_LOG"; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
+echo "PROOF adding the new group member on the peer (silent roster change)"
+: >"$ROSTER_SWAP_FILE"
+sleep 1
+grep -E "roster refreshed" "$PEER_LOG" || true
 
-send_once 1
-if ! wait_for_socket_send; then
-  echo "PROOF first send reached no socket delivery; retrying through the same CLI"
-  send_once 2
-  if ! wait_for_socket_send; then
-    echo "PROOF no socket sendMessage observed; see $SEND_LOG.1 and $SEND_LOG.2"
+echo "PROOF running shipped CLI send"
+set +e
+"${CLI_CMD[@]}" message send \
+  --channel whatsapp \
+  --target "$GROUP_JID" \
+  --message "handoff ping @15550000333" \
+  --json >"$SEND_LOG" 2>&1
+SEND_STATUS=$?
+set -e
+echo "PROOF message send exit=$SEND_STATUS"
+cat "$SEND_LOG"
+
+deadline=$((SECONDS + 120))
+while ! grep -q "delivery decrypted\|delivery FAILED" "$PEER_LOG"; do
+  if (( SECONDS > deadline )); then
+    echo "PROOF no delivered group stanza observed; peer tail:"
+    tail -n 40 "$PEER_LOG" || true
+    exit 1
   fi
+  sleep 1
+done
+
+echo "PROOF delivery observed on the peer device:"
+grep -E "message stanza|message participants|delivery " "$PEER_LOG" | tail -n 6
+
+if [[ "$VARIANT" == "fixed" ]]; then
+  EXPECTED="mentionedJid=[\"$MENTION_JID\"]"
+else
+  EXPECTED="mentionedJid=[]"
 fi
 
-sleep 3
-cleanup
-GATEWAY_PID=""
+if grep -qF "$EXPECTED" "$PEER_LOG"; then
+  echo "PROOF RESULT variant=$VARIANT expected=$EXPECTED observed=OK"
+else
+  echo "PROOF RESULT variant=$VARIANT expected=$EXPECTED observed=UNEXPECTED"
+  tail -n 20 "$PEER_LOG" || true
+  exit 1
+fi
 
-echo "PROOF ${VARIANT} trace from Gateway process:"
+echo "PROOF ${VARIANT} trace from the Gateway process:"
 grep -E "^PROOF " "$GATEWAY_LOG" || true
 echo "PROOF ${VARIANT} done"
