@@ -1,0 +1,35 @@
+name: Windows Peer-Link Case Proof (PR #201707 / issue #201589)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-peer-link-proof:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout oc-winproof (proof scripts)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run native Windows proof (BASE pristine stable / HEAD mirrored patch)
+        shell: pwsh
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: pwsh -NoProfile -File proofs/201589/run-proof.ps1
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-peer-link-proof-201589
+          path: proofs/201589/out/
+          retention-days: 30
+          if-no-files-found: warn
